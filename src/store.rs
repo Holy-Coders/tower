@@ -37,6 +37,16 @@ pub struct GateRunRow { pub id: i64, pub repo_id: i64, pub changeset_id: String,
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartialClaimResult { pub granted_nodes: Vec<ClaimNode>, pub refused: Vec<serde_json::Value> }
 
+/// One self-report outbox row (Phase 2.3). Coalesced by `signature`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportRow {
+    pub id: i64, pub repo_id: i64, pub signature: String, pub kind: String,
+    pub title: String, pub body: String, pub context_json: String,
+    pub state: String, pub occurrence_count: i64, pub first_seen: i64,
+    pub last_seen: i64, pub filed_url: Option<String>, pub filed_at: Option<i64>,
+    #[serde(default)] pub last_commented_threshold: i64,
+}
+
 impl Store {
     pub fn open(home: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&home).with_context(|| format!("create {}", home.display()))?;
@@ -66,7 +76,8 @@ impl Store {
              CREATE TABLE IF NOT EXISTS decisions(id TEXT NOT NULL, repo_id INTEGER NOT NULL, text TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, PRIMARY KEY(repo_id,id));
              CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, repo_id INTEGER NOT NULL, kind TEXT NOT NULL, payload_json TEXT NOT NULL, created_at INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS gate_runs(id INTEGER PRIMARY KEY, repo_id INTEGER NOT NULL, changeset_id TEXT NOT NULL, tier INTEGER NOT NULL, command TEXT NOT NULL, passed INTEGER NOT NULL, output TEXT NOT NULL, created_at INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS leases(repo_id INTEGER PRIMARY KEY, holder TEXT NOT NULL, acquired_at INTEGER NOT NULL);",
+             CREATE TABLE IF NOT EXISTS leases(repo_id INTEGER PRIMARY KEY, holder TEXT NOT NULL, acquired_at INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY, repo_id INTEGER NOT NULL, signature TEXT NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, context_json TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'queued', occurrence_count INTEGER NOT NULL DEFAULT 1, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, filed_url TEXT, filed_at INTEGER, last_commented_threshold INTEGER NOT NULL DEFAULT 0, UNIQUE(repo_id,signature));",
         )?;
         // Phase 2.1 additive migrations: v1 homes gain the new columns in place.
         self.add_column_if_missing("changesets", "version", "INTEGER NOT NULL DEFAULT 1")?;
@@ -356,6 +367,59 @@ impl Store {
     pub fn lease_release(&self, repo_id: i64, holder: &str) -> Result<()> {
         self.conn.execute("DELETE FROM leases WHERE repo_id=?1 AND holder=?2", params![repo_id, holder])?;
         self.emit(repo_id, "lease_released", serde_json::json!({"holder": holder}))?;
+        Ok(())
+    }
+    // ---- self-reports (Phase 2.3 outbox) ----
+    fn report_from_row(r: &rusqlite::Row) -> rusqlite::Result<ReportRow> {
+        Ok(ReportRow { id: r.get(0)?, repo_id: r.get(1)?, signature: r.get(2)?, kind: r.get(3)?, title: r.get(4)?, body: r.get(5)?, context_json: r.get(6)?, state: r.get(7)?, occurrence_count: r.get(8)?, first_seen: r.get(9)?, last_seen: r.get(10)?, filed_url: r.get(11)?, filed_at: r.get(12)?, last_commented_threshold: r.get(13)? })
+    }
+    const REPORT_COLS: &'static str = "id,repo_id,signature,kind,title,body,context_json,state,occurrence_count,first_seen,last_seen,filed_url,filed_at,last_commented_threshold";
+    /// Insert a report, or coalesce into the existing row with the same
+    /// signature (queued or filed): bump count + last_seen. Returns
+    /// (row, created, previous_count).
+    pub fn upsert_report_at(&self, repo_id: i64, signature: &str, kind: &str, title: &str, body: &str, context_json: &str, now: i64) -> Result<(ReportRow, bool, i64)> {
+        if let Some(existing) = self.report_by_signature(repo_id, signature)? {
+            let prev = existing.occurrence_count;
+            self.conn.execute("UPDATE reports SET occurrence_count=occurrence_count+1,last_seen=?1 WHERE repo_id=?2 AND signature=?3", params![now, repo_id, signature])?;
+            self.emit(repo_id, "report_coalesced", serde_json::json!({"signature": signature, "kind": kind, "occurrence_count": prev + 1}))?;
+            Ok((self.report_by_signature(repo_id, signature)?.unwrap(), false, prev))
+        } else {
+            self.conn.execute("INSERT INTO reports(repo_id,signature,kind,title,body,context_json,state,occurrence_count,first_seen,last_seen) VALUES(?1,?2,?3,?4,?5,?6,'queued',1,?7,?7)", params![repo_id, signature, kind, title, body, context_json, now])?;
+            self.emit(repo_id, "report_created", serde_json::json!({"signature": signature, "kind": kind, "title": title}))?;
+            Ok((self.report_by_signature(repo_id, signature)?.unwrap(), true, 0))
+        }
+    }
+    pub fn upsert_report(&self, repo_id: i64, signature: &str, kind: &str, title: &str, body: &str, context_json: &str) -> Result<(ReportRow, bool, i64)> {
+        self.upsert_report_at(repo_id, signature, kind, title, body, context_json, now_secs())
+    }
+    pub fn report_by_signature(&self, repo_id: i64, signature: &str) -> Result<Option<ReportRow>> {
+        let mut st = self.conn.prepare(&format!("SELECT {} FROM reports WHERE repo_id=?1 AND signature=?2", Self::REPORT_COLS))?;
+        let mut rows = st.query_map(params![repo_id, signature], Self::report_from_row)?;
+        Ok(rows.next().transpose()?)
+    }
+    pub fn list_reports(&self, repo_id: i64) -> Result<Vec<ReportRow>> {
+        let mut st = self.conn.prepare(&format!("SELECT {} FROM reports WHERE repo_id=?1 ORDER BY first_seen,id", Self::REPORT_COLS))?;
+        let rows = st.query_map(params![repo_id], Self::report_from_row)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+    pub fn queued_reports(&self, repo_id: i64) -> Result<Vec<ReportRow>> {
+        Ok(self.list_reports(repo_id)?.into_iter().filter(|r| r.state == "queued").collect())
+    }
+    pub fn mark_report_filed_at(&self, repo_id: i64, signature: &str, url: &str, filed_at: i64) -> Result<()> {
+        self.conn.execute("UPDATE reports SET state='filed',filed_url=?1,filed_at=?2 WHERE repo_id=?3 AND signature=?4", params![url, filed_at, repo_id, signature])?;
+        self.emit(repo_id, "report_filed", serde_json::json!({"signature": signature, "filed_url": url}))?;
+        Ok(())
+    }
+    pub fn mark_report_filed(&self, repo_id: i64, signature: &str, url: &str) -> Result<()> {
+        self.mark_report_filed_at(repo_id, signature, url, now_secs())
+    }
+    /// Reports filed on/after `day_start` (caller's day boundary, UTC).
+    pub fn filed_since_count(&self, repo_id: i64, day_start: i64) -> Result<i64> {
+        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM reports WHERE repo_id=?1 AND state='filed' AND filed_at>=?2", params![repo_id, day_start], |r| r.get(0))?;
+        Ok(n)
+    }
+    pub fn set_report_comment_threshold(&self, repo_id: i64, signature: &str, threshold: i64) -> Result<()> {
+        self.conn.execute("UPDATE reports SET last_commented_threshold=?1 WHERE repo_id=?2 AND signature=?3", params![threshold, repo_id, signature])?;
         Ok(())
     }
 }

@@ -61,8 +61,8 @@ echo x > "$SCRATCH/repo/x.txt"; git -C "$SCRATCH/repo" add -A; git -C "$SCRATCH/
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
   | "$BIN" --repo "$SCRATCH/repo" serve-mcp > "$SCRATCH/tools.jsonl" 2>/dev/null
 N_TOOLS="$(grep -o '"name":' "$SCRATCH/tools.jsonl" | wc -l | tr -d ' ')"
-[ "$N_TOOLS" = "19" ] || die "MCP smoke test: expected 19 tools, got $N_TOOLS."
-ok "tower init + board work; MCP serve-mcp advertises 19 tools"
+[ "$N_TOOLS" = "20" ] || die "MCP smoke test: expected 20 tools, got $N_TOOLS."
+ok "tower init + board work; MCP serve-mcp advertises 20 tools"
 
 step "5/6 MCP registration"
 CODEX_CFG="$HOME/.codex/config.toml"

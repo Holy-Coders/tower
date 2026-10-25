@@ -202,14 +202,15 @@ stays in the worker's worktree.
 
 `tower serve-mcp` is a stdio MCP server (JSON-RPC 2.0, line-delimited)
 exposing all 16 spec tools plus Phase 2.1's `changeset_refresh` and
-`changeset_supersede` and Phase 2.2's `changeset_conflicts` (19 total):
+`changeset_supersede`, Phase 2.2's `changeset_conflicts`, and Phase
+2.3's `report_create` (20 total):
 `board_get`, `task_create`,
 `task_plan_save`, `claim_acquire`, `claim_release`, `worktree_create`,
 `worktree_list`, `changeset_register`, `changeset_status`,
 `changeset_refresh`, `changeset_supersede`, `changeset_conflicts`,
 `integration_order`,
 `gate_run`, `escalate_create`, `escalate_resolve`, `decision_list`,
-`decision_log`, `events_since`. `claim_acquire` returns the partial-grant
+`decision_log`, `events_since`, `report_create`. `claim_acquire` returns the partial-grant
 fields (`granted_nodes`, `refused`) and `claim_release` takes an optional
 `nodes` array for per-node release. `changeset_status` includes
 `claimed_vs_actual` (same shape as `board_get`), and
@@ -247,18 +248,92 @@ extra_triggers = []
 
 [limits]
 max_concurrent_assignments = 4
+
+[feedback]
+repo = "Holy-Coders/tower"   # where Tower self-reports are filed
+enabled = true               # false: record locally, never file
 ```
 
 `reserved` and `limits` are parsed and shown but not enforced in v1 (see
 limitations below); gates are what drive green/yellow/red beyond Tier-0.
 
+## Self-reporting: Tower files issues about itself
+
+Agents using Tower hit Tower's own bugs and inefficiencies. Phase 2.3
+captures that signal and files it as GitHub issues on the feedback
+repo (default `Holy-Coders/tower`), so using Tower improves Tower.
+
+**Explicit reports (agent-initiated).**
+
+```sh
+tower report --kind bug --title "board contradicts changeset status" \
+  --body "board said green, status said red" --command "tower board"
+tower report --kind inefficiency --title "gate run disrupted work" --body "..."
+tower report list    # queued + filed, with states and occurrence counts
+tower report flush   # try to file queued reports now
+```
+
+The MCP mirror is `report_create` (same fields plus `repo`); its tool
+description tells agents to report Tower itself — unexpected failures,
+contradictions between Tower commands or CLI/MCP, disruptive slowness,
+workarounds — and never bugs in the code they are orchestrating. Each
+report is enriched automatically with the Tower version, OS, timestamp,
+kind, Tower IDs in context (recent task/assignment/changeset IDs), and
+the triggering command when supplied.
+
+**Automatic capture (Tower-initiated).** CLI dispatch and MCP tool
+handling are wrapped: an internal Tower failure (internal error, a
+panic caught at the dispatch boundary, an invariant contradiction)
+drafts a `bug` report, and any operation over 5 seconds (except
+`watch`, a loop by design, and the long-running MCP server itself)
+drafts an `inefficiency` report with the measured duration. Expected
+user errors (unknown IDs, unregistered repo, missing arguments,
+refused claims, non-landable changesets) are not reported. Reporting
+is a side effect that can never fail or change the outcome of the
+operation that triggered it.
+
+**Outbox, filing, dedupe, caps.** Reports persist in Tower's store
+(signature, kind, title, body, context, state queued/filed, occurrence
+count, first/last seen, filed URL). Filing uses the `gh` CLI
+(`gh issue create --repo <feedback-repo> --label tower-auto-report
+--label <kind>`; binary from PATH, overridable with `TOWER_GH`), with
+a `<!-- tower-signature: ... -->` marker in the body. It is attempted
+immediately after a report is created, at the start of `board` /
+`changeset status` (CLI and MCP), and via `report flush` — always
+best-effort and silent: if `gh` is missing, unauthenticated, or
+offline, reports stay queued. The signature is a stable hash of the
+kind, normalized title (lowercased, whitespace collapsed, varying
+IDs/numbers stripped), and normalized command key; repeats coalesce
+locally into one row with an occurrence count (crossing 10/100/1000
+may add a comment to the filed issue). Before filing, open
+`tower-auto-report` issues are searched for the signature and a match
+is adopted instead of duplicated. At most 5 issues are filed per repo
+per day (UTC); beyond the cap reports stay queued, never dropped.
+
+**Configuration and disabling.** In `tower.toml`:
+
+```toml
+[feedback]
+repo = "Holy-Coders/tower"   # any "owner/name"
+enabled = true               # false: reports recorded locally, never filed
+```
+
+**Privacy rules (hard).** A report never contains file contents,
+diffs, code, secrets, tokens, or environment values. The home
+directory prefix is stripped from paths (repo-relative where
+possible), and the value of any captured flag whose name contains
+`key`, `token`, `secret`, `password`, or `auth` is replaced with
+`[redacted]` before anything is stored or filed (unit-tested with a
+planted fake secret).
+
 ## Verify your build
 
 ```sh
-cargo test                # 37 tests, incl. candidate-landing, staleness, supersede, claims-on-land, conflict detail
+cargo test                # 45 tests, incl. candidate-landing, staleness, supersede, claims-on-land, conflict detail, self-reporting
 scripts/demo.sh           # 6-step acceptance demo, PASS/FAIL per assertion (51)
 scripts/demo-phase21.sh   # sequential candidate landing + refused conflict (47)
 scripts/demo-phase22.sh   # claims survive landing, per-test-fn claims, conflict hunks (60)
+scripts/demo-phase23.sh   # self-reporting vs a stub gh: file, coalesce, queue, flush, cap (51)
 ```
 
 ## Known limitations / stubs

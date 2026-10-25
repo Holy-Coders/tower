@@ -169,7 +169,7 @@ TOOLS_LINE="$(grep '"id":2' "$OUT/mcp1-out.jsonl" | head -1)"
 N_TOOLS="$(printf '%s' "$TOOLS_LINE" | grep -o '"name":' | wc -l | tr -d ' ')"
 # Phase 2.1 intentional change: 16 spec tools + changeset_refresh/supersede;
 # Phase 2.2 adds changeset_conflicts (19 total).
-if [ "$N_TOOLS" = "19" ]; then pass "MCP tools/list advertises 19 tools (16 + refresh/supersede/conflicts)"; else fail "MCP tools/list advertises 19 tools (got $N_TOOLS)"; fi
+if [ "$N_TOOLS" = "20" ]; then pass "MCP tools/list advertises 20 tools (16 + refresh/supersede/conflicts/report)"; else fail "MCP tools/list advertises 20 tools (got $N_TOOLS)"; fi
 grepq "MCP task_create -> T-4" "$OUT/mcp1-out.jsonl" '"task_id":"T-4"'
 grepq "MCP worktree_create -> A-4" "$OUT/mcp1-out.jsonl" '"assignment_id":"A-4"'
 grepq "MCP claim granted" "$OUT/mcp1-out.jsonl" '"granted":true'

@@ -1,6 +1,7 @@
 mod board;
 mod config;
 mod engine;
+mod feedback;
 mod git;
 mod index;
 mod mcp;
@@ -18,7 +19,7 @@ use config::TowerConfig;
 use store::{ClaimNode, Store};
 
 #[derive(Parser)]
-#[command(name = "tower", about = "Tower — local orchestration for parallel agent work in git worktrees")]
+#[command(name = "tower", version, about = "Tower — local orchestration for parallel agent work in git worktrees")]
 struct Cli {
     /// Repo path (default: current directory)
     #[arg(long, global = true)]
@@ -51,6 +52,19 @@ enum Command {
     Lease { #[command(subcommand)] cmd: LeaseCmd },
     /// Land a landable changeset (fast-forward, or Tower-built candidate; refuses red / non-landable)
     Land { changeset: String },
+    /// Report a Tower bug/inefficiency (filed on the feedback repo); `report list` / `report flush` inspect the outbox
+    Report {
+        #[command(subcommand)]
+        cmd: Option<ReportCmd>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long = "command")]
+        command_str: Option<String>,
+    },
     /// MCP server over stdio (JSON-RPC 2.0, line-delimited)
     ServeMcp,
     Lsp,
@@ -109,6 +123,15 @@ enum EscalateCmd {
 enum DecisionsCmd { List, Log { text: String }, Revoke { id: String } }
 #[derive(Subcommand)]
 enum LeaseCmd { Acquire { #[arg(long)] holder: String }, Release { #[arg(long)] holder: String }, Status }
+#[derive(Subcommand)]
+enum ReportCmd {
+    /// Create a report (same as `tower report --kind ...`)
+    Create { #[arg(long)] kind: String, #[arg(long)] title: String, #[arg(long)] body: String, #[arg(long = "command")] command_str: Option<String> },
+    /// List queued + filed reports with states and occurrence counts
+    List,
+    /// Attempt to file queued reports via gh now
+    Flush,
+}
 
 fn repo_root(cli_repo: &Option<PathBuf>) -> Result<PathBuf> {
     let start = cli_repo.clone().unwrap_or_else(|| std::env::current_dir().unwrap());
@@ -126,11 +149,70 @@ fn parse_nodes(raw: &[String]) -> Vec<ClaimNode> {
 }
 fn print_json(v: &serde_json::Value) { println!("{}", serde_json::to_string_pretty(v).unwrap()); }
 
+fn command_name(cli: &Cli) -> &'static str {
+    match &cli.command {
+        Command::Init { .. } => "init",
+        Command::Board { .. } => "board",
+        Command::Watch { .. } => "watch",
+        Command::Task { .. } => "task",
+        Command::Assignment { .. } => "assignment",
+        Command::Claim { .. } => "claim",
+        Command::Worktree { .. } => "worktree",
+        Command::Changeset { cmd } => match cmd { ChangesetCmd::Status { .. } => "changeset status", _ => "changeset" },
+        Command::Gate { .. } => "gate",
+        Command::MergeCheck => "merge-check",
+        Command::Order => "order",
+        Command::Escalate { .. } => "escalate",
+        Command::Decisions { .. } => "decisions",
+        Command::Events { .. } => "events",
+        Command::Lease { .. } => "lease",
+        Command::Land { .. } => "land",
+        Command::Report { .. } => "report",
+        Command::ServeMcp => "serve-mcp",
+        Command::Lsp => "lsp",
+        Command::Duplicates => "duplicates",
+        Command::Github => "github",
+    }
+}
+
+/// Best-effort repo context for auto-capture; None when the repo is not
+/// resolvable/registered (then there is no outbox to draft into).
+fn try_registered(store: &Store, cli_repo: &Option<PathBuf>) -> Option<(i64, PathBuf, TowerConfig)> {
+    registered(store, cli_repo).ok()
+}
+
 fn main() -> Result<()> {
+    let argv: Vec<String> = std::env::args().collect();
     let cli = Cli::parse();
     let home = config::tower_home();
     let store = Store::open(home)?;
-    run(&cli, &store)
+    let op = command_name(&cli);
+    let cmdline = argv.join(" ");
+    let start = std::time::Instant::now();
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&cli, &store)));
+    let elapsed = start.elapsed();
+    let result = match caught {
+        Ok(r) => r,
+        Err(payload) => {
+            let detail = payload.downcast_ref::<&str>().map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            if let Some((rid, root, cfg)) = try_registered(&store, &cli.repo) {
+                feedback::capture_panic(&store, rid, &root, &cfg, op, &detail, &cmdline);
+            }
+            std::panic::resume_unwind(payload);
+        }
+    };
+    // Auto-capture is a side effect: it never changes this outcome.
+    if op != "watch" && op != "serve-mcp" && op != "report" {
+        if let Some((rid, root, cfg)) = try_registered(&store, &cli.repo) {
+            if let Err(e) = &result {
+                feedback::capture_internal_error(&store, rid, &root, &cfg, op, &format!("{e:#}"), &cmdline);
+            }
+            feedback::maybe_report_slow(&store, rid, &root, &cfg, op, elapsed);
+        }
+    }
+    result
 }
 
 fn run(cli: &Cli, store: &Store) -> Result<()> {
@@ -157,6 +239,7 @@ fn run(cli: &Cli, store: &Store) -> Result<()> {
         }
         Command::Board { html, json } => {
             let (rid, root, cfg) = registered(store, &cli.repo)?;
+            feedback::flush_best_effort(store, rid, &cfg);
             let b = board::build_board(store, rid, &root, &cfg)?;
             if let Some(p) = html { std::fs::write(p, board::render_html(&b))?; }
             if *json { print_json(&b); } else { print!("{}", board::render_text(&b)); }
@@ -222,7 +305,7 @@ fn run(cli: &Cli, store: &Store) -> Result<()> {
             let (rid, root, cfg) = registered(store, &cli.repo)?;
             match cmd {
                 ChangesetCmd::Register { assignment, worktree } => print_json(&engine::register_changeset(store, rid, &root, &cfg, assignment, worktree)?),
-                ChangesetCmd::Status { id } => print_json(&board::changeset_status_value(store, rid, &root, &cfg, id)?),
+                ChangesetCmd::Status { id } => { feedback::flush_best_effort(store, rid, &cfg); print_json(&board::changeset_status_value(store, rid, &root, &cfg, id)?); }
                 ChangesetCmd::List => print_json(&serde_json::json!(store.list_changesets(rid)?)),
                 ChangesetCmd::Refresh { id } => print_json(&engine::refresh_changeset(store, rid, &root, &cfg, id)?),
                 ChangesetCmd::Supersede { id } => print_json(&engine::supersede_changeset(store, rid, &root, &cfg, id)?),
@@ -291,6 +374,30 @@ fn run(cli: &Cli, store: &Store) -> Result<()> {
         Command::Land { changeset } => {
             let (rid, root, cfg) = registered(store, &cli.repo)?;
             print_json(&engine::land_changeset(store, rid, &root, &cfg, changeset)?);
+            Ok(())
+        }
+        Command::Report { cmd, kind, title, body, command_str } => {
+            let (rid, root, cfg) = registered(store, &cli.repo)?;
+            match cmd {
+                Some(ReportCmd::List) => {
+                    let rows = store.list_reports(rid)?;
+                    print_json(&serde_json::json!({"reports": rows.iter().map(feedback::report_value).collect::<Vec<_>>()}));
+                }
+                Some(ReportCmd::Flush) => {
+                    let mut v = feedback::flush_reports(store, rid, &cfg);
+                    v["reports"] = serde_json::json!(store.list_reports(rid)?.iter().map(feedback::report_value).collect::<Vec<_>>());
+                    print_json(&v);
+                }
+                Some(ReportCmd::Create { kind, title, body, command_str }) => {
+                    print_json(&feedback::create_report(store, rid, &root, &cfg, kind, title, body, command_str.as_deref())?);
+                }
+                None => {
+                    let kind = kind.as_deref().with_context(|| "missing arg: --kind (bug|inefficiency)")?;
+                    let title = title.as_deref().with_context(|| "missing arg: --title")?;
+                    let body = body.as_deref().with_context(|| "missing arg: --body")?;
+                    print_json(&feedback::create_report(store, rid, &root, &cfg, kind, title, body, command_str.as_deref())?);
+                }
+            }
             Ok(())
         }
         Command::ServeMcp => mcp::serve(store),

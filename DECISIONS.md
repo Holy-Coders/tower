@@ -235,3 +235,91 @@ brief. Each entry notes the alternative that was not taken.
     `--json` and MCP return the structured value. Nothing is merged
     or resolved and no worktree is written — resolution stays in the
     worker's worktree, as everywhere else in Tower.
+
+## Phase 2.3 (self-reporting: Tower files issues about itself)
+
+25. **Self-reports live in a store outbox and are filed via `gh`,
+    best-effort and silent.** A new additive `reports` table (signature,
+    kind, title, body, context JSON, state queued/filed, occurrence
+    count, first/last seen, filed URL/at, last commented threshold,
+    unique per repo+signature) is the single outbox
+    (`src/feedback.rs` owns the logic; `Store::upsert_report` /
+    `mark_report_filed` own the rows). Filing shells out to
+    `gh issue create --repo <feedback-repo> --label tower-auto-report
+    --label <kind>` with a `<!-- tower-signature: <sig> -->` trailer;
+    the binary is `TOWER_GH` or `gh` on PATH, which is also the test
+    seam (stub scripts log argv and print a fake URL, or exit nonzero
+    to simulate no-auth). Flush happens immediately after a report is
+    created, opportunistically at the start of `board` / `changeset
+    status` (CLI and MCP), and via `tower report flush`; a missing,
+    unauthenticated, or offline `gh` leaves reports queued and never
+    blocks or fails the user's operation. The feedback repo is
+    `Holy-Coders/tower` by default, overridable in `[feedback]`
+    (`repo`, `enabled`); `enabled = false` records locally and never
+    files. Explicit entry points are `tower report --kind bug|inefficiency
+    --title ... --body ... [--command ...]` (plus `report list` /
+    `report flush` / `report create`) and MCP `report_create`
+    (surface 19 → 20 tools), whose description fences reports to
+    Tower itself, never the orchestrated code. Crate version 0.2.0.
+    Alternative not taken: a direct GitHub API client — a new HTTP/TLS
+    dependency plus token management Tower otherwise has no need for;
+    `gh` already owns auth.
+
+26. **Auto-capture classifies errors, catches panics at the boundary,
+    and times operations — and can never change the outcome.** CLI
+    `main` and MCP `dispatch` wrap their inner dispatch in
+    `catch_unwind`, timing, and error inspection. A panic drafts a
+    `bug` report and is then resumed unchanged. An error result drafts
+    a `bug` report only when `feedback::is_internal_error` judges it
+    Tower's fault: expected user errors (unknown IDs, unregistered
+    repo, missing arguments, refused claims, held leases, non-landable
+    changesets) are excluded first, then internal markers (panic,
+    invariant, contradiction/mismatch, database, merge-tree/git
+    internal failures) must be present. Operations over the 5-second
+    threshold draft an `inefficiency` report, excluding `watch` (a
+    loop by design), the long-running `serve-mcp` process (its
+    individual tool calls are timed instead), and `report` itself (so
+    filing can never recursively report on filing). The threshold is
+    overridable via `TOWER_SLOW_REPORT_MS` for tests/demos; the
+    production default stays 5s. Every auto-capture path discards its
+    own result, so the triggering command's exit and output are
+    untouched (pinned by the failing-gh integration test). Alternative
+    not taken: reporting every error — refused claims and unknown IDs
+    are Tower working as designed and would drown the real signal.
+
+27. **Dedupe is a normalized signature, coalesced locally, adopted
+    remotely, and capped per UTC day.** The signature is an FNV-1a
+    hash (the codebase's existing hash style, cf. `config::repo_hash`)
+    of kind + normalized title + normalized command key, where
+    normalization lowercases, collapses whitespace, and replaces digit
+    runs and long hex tokens with `#`, so varying Tower IDs, counts,
+    and durations coalesce. A repeat increments the existing row's
+    occurrence count and last-seen whether queued or filed; crossing
+    10/100/1000 occurrences on a filed report posts one comment per
+    crossed threshold via `gh issue comment` (best-effort, tracked in
+    `last_commented_threshold`). Before creating, one
+    `gh issue list --repo <repo> --label tower-auto-report --state open
+    --limit 100` per flush (plus a `--json url,title,body` variant
+    when supported, since the plain listing has no bodies to match the
+    signature marker in) is searched for the signature; a hit adopts
+    that issue's URL instead of opening a duplicate. At most 5 issues
+    are filed per repo per UTC day (day boundary is UTC midnight, so
+    the cap needs no timezone dependency); beyond it reports stay
+    queued with their counts, never dropped.
+
+28. **Scrubbing runs before storage, and fails closed on sensitive
+    names.** Titles, bodies, error text, MCP argument dumps, and
+    captured command strings all pass through `feedback::scrub`
+    before anything is persisted: the repo's absolute prefix is
+    replaced with repo-relative form, the home-directory prefix with
+    `~/`, and the value of any flag, `name=value`, or `name: value`
+    pair whose name contains key/token/secret/password/auth
+    (case-insensitive substring — so `--api-key`, `API_KEY=`, and
+    spelled-out variants all match) becomes `[redacted]`, including
+    the following token of a `--flag value` pair. Auto context carries
+    only version, OS/arch, timestamp, kind, recent Tower IDs, and the
+    scrubbed command — never file contents, diffs, code, secrets, or
+    environment values; a planted-fake-secret unit test asserts the
+    secret appears neither in scrubbed output nor in the generated
+    issue body. Alternative not taken: redacting only at filing time —
+    the outbox itself would then persist secrets at rest.

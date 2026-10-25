@@ -21,9 +21,44 @@ fn s(args: &serde_json::Value, key: &str) -> Result<String> {
     args.get(key).and_then(|v| v.as_str()).map(|v| v.to_string()).with_context(|| format!("missing string arg: {key}"))
 }
 
+/// MCP dispatch wrapped with Phase 2.3 auto-capture (timing, internal
+/// errors, panics). Reporting is a side effect: it never changes the
+/// tool call's outcome.
 pub fn dispatch(store: &Store, name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
+    let start = std::time::Instant::now();
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch_inner(store, name, args)));
+    let elapsed = start.elapsed();
+    let result = match caught {
+        Ok(r) => r,
+        Err(payload) => {
+            let detail = payload.downcast_ref::<&str>().map(|v| v.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            if let Some(repo) = args.get("repo").and_then(|v| v.as_str()) {
+                if let Ok((rid, root, cfg)) = resolve(store, repo) {
+                    crate::feedback::capture_panic(store, rid, &root, &cfg, name, &detail, &format!("mcp:{name} {}", crate::feedback::scrub(&args.to_string(), Some(&root))));
+                }
+            }
+            std::panic::resume_unwind(payload);
+        }
+    };
+    if name != "report_create" {
+        if let Some(repo) = args.get("repo").and_then(|v| v.as_str()) {
+            if let Ok((rid, root, cfg)) = resolve(store, repo) {
+                let cmd = format!("mcp:{name} {}", crate::feedback::scrub(&args.to_string(), Some(&root)));
+                if let Err(e) = &result {
+                    crate::feedback::capture_internal_error(store, rid, &root, &cfg, name, &format!("{e:#}"), &cmd);
+                }
+                crate::feedback::maybe_report_slow(store, rid, &root, &cfg, name, elapsed);
+            }
+        }
+    }
+    result
+}
+
+fn dispatch_inner(store: &Store, name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
     match name {
-        "board_get" => { let (rid, root, cfg) = resolve(store, &s(args, "repo")?)?; board::build_board(store, rid, &root, &cfg) }
+        "board_get" => { let (rid, root, cfg) = resolve(store, &s(args, "repo")?)?; crate::feedback::flush_best_effort(store, rid, &cfg); board::build_board(store, rid, &root, &cfg) }
         "worktree_list" => {
             let (_, root, cfg) = resolve(store, &s(args, "repo")?)?;
             let _ = cfg;
@@ -69,7 +104,12 @@ pub fn dispatch(store: &Store, name: &str, args: &serde_json::Value) -> Result<s
         }
         "changeset_status" => {
             let (rid, root, cfg) = resolve(store, &s(args, "repo")?)?;
+            crate::feedback::flush_best_effort(store, rid, &cfg);
             board::changeset_status_value(store, rid, &root, &cfg, &s(args, "changeset_id")?)
+        }
+        "report_create" => {
+            let (rid, root, cfg) = resolve(store, &s(args, "repo")?)?;
+            crate::feedback::create_report(store, rid, &root, &cfg, &s(args, "kind")?, &s(args, "title")?, &s(args, "body")?, args.get("command").and_then(|v| v.as_str()))
         }
         "changeset_refresh" => {
             let (rid, root, cfg) = resolve(store, &s(args, "repo")?)?;
@@ -131,6 +171,7 @@ pub fn tool_defs() -> serde_json::Value {
         t("decision_list", "List decisions", p(&[]), &[]),
         t("decision_log", "Log decision -> D-ID", p(&[("text", st.clone())]), &["text"]),
         t("events_since", "Event log stream", p(&[("cursor", serde_json::json!({"type": "integer"}))]), &[]),
+        t("report_create", "Report Tower itself: a command failed unexpectedly, output contradicts Tower's own state (e.g. board vs changeset status), CLI and MCP disagree, an operation was slow enough to disrupt your work, or you had to work around Tower. Do NOT report bugs in the code you are orchestrating — only bugs or inefficiencies in Tower.", p(&[("kind", serde_json::json!({"type": "string", "enum": ["bug", "inefficiency"]})), ("title", st.clone()), ("body", st.clone()), ("command", st.clone())]), &["kind", "title", "body"]),
     ])
 }
 
@@ -146,7 +187,7 @@ pub fn serve(store: &Store) -> Result<()> {
         let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
         if method.starts_with("notifications/") || id.is_null() && method.is_empty() { continue; }
         let resp = match method {
-            "initialize" => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "tower", "version": "0.1.0"}}}),
+            "initialize" => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "tower", "version": env!("CARGO_PKG_VERSION")}}}),
             "ping" => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}),
             "tools/list" => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"tools": tool_defs()}}),
             "tools/call" => {

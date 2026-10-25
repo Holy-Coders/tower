@@ -466,7 +466,7 @@ fn mcp_tools_mirror_the_cli_surface() {
     assert!(mcp::dispatch(&fx.store, "not_a_tool", &serde_json::json!({"repo": repo_s})).is_err());
     // tools/list advertises the 16 spec tools + Phase 2.1
     // changeset_refresh/supersede + Phase 2.2 changeset_conflicts.
-    assert_eq!(mcp::tool_defs().as_array().unwrap().len(), 19);
+    assert_eq!(mcp::tool_defs().as_array().unwrap().len(), 20);
 }
 
 // ---------- merge simulation primitive ----------
@@ -1046,3 +1046,198 @@ fn changeset_conflicts_against_main_after_main_advances() {
 }
 
 
+
+// ---------- Phase 2.3: self-reporting ----------
+
+use crate::feedback;
+
+fn feedback_cfg(enabled: bool) -> TowerConfig {
+    let mut cfg = TowerConfig::default();
+    cfg.feedback.enabled = enabled;
+    cfg.feedback.repo = "Holy-Coders/tower".into();
+    cfg
+}
+
+fn stub_gh(dir: &Path, mode: &str, list_output: &str) -> (PathBuf, PathBuf) {
+    let log = dir.join("gh.log");
+    let script = dir.join("gh-stub.sh");
+    let body = match mode {
+        "fail" => format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 1\n", log.display()),
+        _ => format!(
+            "#!/bin/sh\necho \"$@\" >> '{log}'\nif [ \"$1 $2\" = \"issue list\" ]; then cat <<'LISTEOF'\n{list_output}\nLISTEOF\nexit 0; fi\nif [ \"$1 $2\" = \"issue create\" ]; then echo 'https://github.com/Holy-Coders/tower/issues/42'; exit 0; fi\nif [ \"$1 $2\" = \"issue comment\" ]; then echo 'https://github.com/Holy-Coders/tower/issues/42#issuecomment-1'; exit 0; fi\nexit 0\n",
+            log = log.display(), list_output = list_output
+        ),
+    };
+    write(&script, &body);
+    #[cfg(unix)]
+    { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap(); }
+    (script, log)
+}
+
+#[test]
+fn signature_normalization_coalesces_varying_ids_numbers_and_case() {
+    let a = feedback::signature("bug", "Board  broke for C-12 in 300 ms", "tower board --repo /x 42");
+    let b = feedback::signature("bug", "board broke for c-99 in 999 ms", "tower   board --repo /x 7");
+    assert_eq!(a, b);
+    assert_ne!(a, feedback::signature("inefficiency", "Board broke for C-12 in 300 ms", "tower board --repo /x 42"));
+    assert_ne!(a, feedback::signature("bug", "Different title", "tower board --repo /x 42"));
+    assert_eq!(feedback::normalize("  Hello   T-123   WORLD 42 "), "hello t-# world #");
+}
+
+#[test]
+fn scrubbing_redacts_fake_secret_and_strips_home() {
+    let cmd = "tower --repo /home/alice/proj changeset status C-1 --api-key SUPERSECRET123 --token=tok_abc999 --password hunter2 --auth bearerXYZ --title ok API_KEY=zzz999";
+    let scrubbed = feedback::scrub_with(cmd, Some("/home/alice"), Some("/home/alice/proj"));
+    for secret in ["SUPERSECRET123", "tok_abc999", "hunter2", "bearerXYZ", "zzz999", "/home/alice"] {
+        assert!(!scrubbed.contains(secret), "scrubbed still contains {secret}: {scrubbed}");
+    }
+    assert!(scrubbed.contains("[redacted]"), "{scrubbed}");
+    // Full issue body built from a report whose command carried the secret.
+    let s = Store::open_memory().unwrap();
+    let r = s.register_repo("/home/alice/proj", "main").unwrap();
+    let cfg = feedback_cfg(false);
+    let v = feedback::create_report_with_gh(&s, r.id, Path::new("/home/alice/proj"), &cfg, "bug", "boom", "details --secret SUPERSECRET123", Some(cmd), "gh").unwrap();
+    let row = s.list_reports(r.id).unwrap().into_iter().next().unwrap();
+    let body = feedback::issue_body(&row);
+    assert!(!body.contains("SUPERSECRET123"), "issue body leaked secret:\n{body}");
+    assert!(!body.contains("/home/alice"), "issue body leaked home:\n{body}");
+    assert!(body.contains(&format!("<!-- tower-signature: {} -->", row.signature)), "{body}");
+    assert_eq!(v["state"], serde_json::json!("queued"), "disabled feedback records locally only: {v}");
+}
+
+#[test]
+fn feedback_config_defaults_and_parsing() {
+    let d = TowerConfig::default();
+    assert_eq!(d.feedback.repo, "Holy-Coders/tower");
+    assert!(d.feedback.enabled);
+    let tmp = tempfile::tempdir().unwrap();
+    write(&tmp.path().join("tower.toml"), "[feedback]\nrepo = \"acme/widgets\"\nenabled = false\n");
+    let cfg = TowerConfig::load(tmp.path());
+    assert_eq!(cfg.feedback.repo, "acme/widgets");
+    assert!(!cfg.feedback.enabled);
+    write(&tmp.path().join("tower.toml"), "[feedback]\nrepo = \"acme/only\"\n");
+    let cfg2 = TowerConfig::load(tmp.path());
+    assert_eq!(cfg2.feedback.repo, "acme/only");
+    assert!(cfg2.feedback.enabled, "partial [feedback] keeps enabled default");
+}
+
+#[test]
+fn report_coalescing_and_daily_cap() {
+    let s = Store::open_memory().unwrap();
+    let r = s.register_repo("/tmp/repo-cap", "main").unwrap();
+    let cfg = feedback_cfg(false);
+    for _ in 0..3 {
+        feedback::create_report_with_gh(&s, r.id, Path::new("/tmp/repo-cap"), &cfg, "bug", "Board broke C-1", "b", Some("tower board 1"), "gh").unwrap();
+    }
+    let rows = s.list_reports(r.id).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].occurrence_count, 3);
+    assert!(!feedback::can_file(5, 5));
+    assert!(feedback::can_file(4, 5));
+    // Six distinct queued reports: one flush files at most five.
+    let tmp = tempfile::tempdir().unwrap();
+    let (gh, log) = stub_gh(tmp.path(), "ok", "[]");
+    for i in 0..6 {
+        feedback::create_report_with_gh(&s, r.id, Path::new("/tmp/repo-cap"), &cfg, "bug", &format!("distinct failure number {i} alpha{i}"), "b", None, "gh").unwrap();
+    }
+    // distinct titles must differ after number normalization: use words instead
+    let words = ["red", "blue", "green", "black", "white", "pink", "gray", "gold"];
+    for w in words { feedback::create_report_with_gh(&s, r.id, Path::new("/tmp/repo-cap"), &cfg, "inefficiency", &format!("slow {w} operation"), "b", None, "gh").unwrap(); }
+    let enabled = feedback_cfg(true);
+    let v = feedback::flush_reports_with_gh(&s, r.id, &enabled, &gh.to_string_lossy());
+    assert_eq!(v["filed"].as_i64().unwrap(), 5, "daily cap of 5: {v}\nlog: {}", std::fs::read_to_string(&log).unwrap_or_default());
+    assert!(s.list_reports(r.id).unwrap().iter().any(|x| x.state == "queued"), "beyond cap stays queued, never dropped");
+}
+
+#[test]
+fn stub_gh_explicit_report_files_then_coalesces_and_failure_queues() {
+    let fx = fixture(false);
+    let cfg = feedback_cfg(true);
+    let (gh, log) = stub_gh(&fx.root, "ok", "[]");
+    let gh_s = gh.to_string_lossy().into_owned();
+    // (a) explicit report files with expected title/labels/signature
+    let v = feedback::create_report_with_gh(&fx.store, fx.rid, &fx.repo, &cfg, "bug", "Board contradicts status", "board says green, status red", Some("tower board"), &gh_s).unwrap();
+    assert_eq!(v["state"], serde_json::json!("filed"), "{v}");
+    assert_eq!(v["filed_url"], serde_json::json!("https://github.com/Holy-Coders/tower/issues/42"));
+    let log1 = std::fs::read_to_string(&log).unwrap();
+    assert!(log1.contains("issue create --repo Holy-Coders/tower"), "{log1}");
+    assert!(log1.contains("--label tower-auto-report") && log1.contains("--label bug"), "{log1}");
+    assert!(log1.contains("tower-signature:"), "{log1}");
+    assert!(log1.contains("Board contradicts status"), "{log1}");
+    let creates1 = log1.matches("issue create").count();
+    // (b) same signature again coalesces, no second issue
+    let v2 = feedback::create_report_with_gh(&fx.store, fx.rid, &fx.repo, &cfg, "bug", "board contradicts status", "again", Some("tower board"), &gh_s).unwrap();
+    assert_eq!(v2["occurrence_count"].as_i64().unwrap(), 2, "{v2}");
+    assert_eq!(std::fs::read_to_string(&log).unwrap().matches("issue create").count(), creates1);
+    assert_eq!(fx.store.list_reports(fx.rid).unwrap().len(), 1);
+    // (c) gh failure leaves queued (create itself still succeeds)
+    let (gh_fail, _) = stub_gh(&fx.root.join("f"), "fail", "");
+    let v3 = feedback::create_report_with_gh(&fx.store, fx.rid, &fx.repo, &cfg, "inefficiency", "gate run very slow", "took ages", None, &gh_fail.to_string_lossy()).unwrap();
+    assert_eq!(v3["state"], serde_json::json!("queued"), "{v3}");
+    // (d) later flush with working gh files the queued report
+    let fv = feedback::flush_reports_with_gh(&fx.store, fx.rid, &cfg, &gh_s);
+    assert!(fv["filed"].as_i64().unwrap() >= 1, "{fv}");
+    assert!(fx.store.list_reports(fx.rid).unwrap().iter().all(|x| x.state == "filed"));
+}
+
+#[test]
+fn remote_dedupe_marks_filed_without_creating() {
+    let fx = fixture(false);
+    let off = feedback_cfg(false);
+    feedback::create_report_with_gh(&fx.store, fx.rid, &fx.repo, &off, "bug", "Remote dup case", "b", None, "gh").unwrap();
+    let sig = fx.store.list_reports(fx.rid).unwrap()[0].signature.clone();
+    let list_json = format!("[{{\"url\":\"https://github.com/Holy-Coders/tower/issues/7\",\"body\":\"x <!-- tower-signature: {sig} -->\"}}]");
+    let (gh, log) = stub_gh(&fx.root.join("rd"), "ok", &list_json);
+    let fv = feedback::flush_reports_with_gh(&fx.store, fx.rid, &feedback_cfg(true), &gh.to_string_lossy());
+    assert_eq!(fv["filed"].as_i64().unwrap(), 1, "{fv}");
+    let row = fx.store.list_reports(fx.rid).unwrap()[0].clone();
+    assert_eq!(row.filed_url.as_deref(), Some("https://github.com/Holy-Coders/tower/issues/7"));
+    assert!(!std::fs::read_to_string(&log).unwrap().contains("issue create"), "remote dedupe must not create");
+}
+
+#[test]
+fn slow_and_internal_capture_classification() {
+    assert!(feedback::is_internal_error("database disk image is malformed"));
+    assert!(feedback::is_internal_error("panicked at 'invariant violated'"));
+    assert!(feedback::is_internal_error("claimed-vs-actual mismatch Tower cannot explain"));
+    assert!(!feedback::is_internal_error("unknown task T-9"));
+    assert!(!feedback::is_internal_error("repo not registered: /x (run: tower init)"));
+    assert!(!feedback::is_internal_error("missing string arg: repo"));
+    assert_eq!(feedback::threshold_crossed(9, 10), Some(10));
+    assert_eq!(feedback::threshold_crossed(10, 11), None);
+    assert_eq!(feedback::threshold_crossed(99, 100), Some(100));
+    let s = Store::open_memory().unwrap();
+    let r = s.register_repo("/tmp/repo-slow", "main").unwrap();
+    let cfg = feedback_cfg(false);
+    feedback::maybe_report_slow_with_gh(&s, r.id, Path::new("/tmp/repo-slow"), &cfg, "board_get", std::time::Duration::from_secs(6), std::time::Duration::from_secs(5), "gh");
+    assert_eq!(s.list_reports(r.id).unwrap().len(), 1);
+    assert_eq!(s.list_reports(r.id).unwrap()[0].kind, "inefficiency");
+    feedback::maybe_report_slow_with_gh(&s, r.id, Path::new("/tmp/repo-slow"), &cfg, "board_get", std::time::Duration::from_secs(1), std::time::Duration::from_secs(5), "gh");
+    assert_eq!(s.list_reports(r.id).unwrap()[0].occurrence_count, 1, "fast op must not draft");
+}
+
+#[test]
+fn mcp_report_create_is_tool_20_and_files_via_stub() {
+    let defs = mcp::tool_defs();
+    let arr = defs.as_array().unwrap();
+    assert_eq!(arr.len(), 20);
+    let rc = arr.iter().find(|t| t["name"] == serde_json::json!("report_create")).expect("report_create advertised");
+    let desc = rc["description"].as_str().unwrap();
+    assert!(desc.contains("Do NOT report bugs in the code you are orchestrating"), "{desc}");
+    assert!(desc.contains("CLI and MCP disagree"), "{desc}");
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = ENV_LOCK.lock().unwrap();
+    let fx = fixture(false);
+    let (gh, log) = stub_gh(&fx.root.join("mcp"), "ok", "[]");
+    std::env::set_var("TOWER_GH", &gh);
+    let repo_s = fx.repo.to_string_lossy().into_owned();
+    let v = mcp::dispatch(&fx.store, "report_create", &serde_json::json!({"repo": repo_s, "kind": "bug", "title": "MCP disagrees with CLI", "body": "details", "command": "tower board --token SUPERSECRET123"}));
+    std::env::remove_var("TOWER_GH");
+    let v = v.unwrap();
+    assert_eq!(v["state"], serde_json::json!("filed"), "{v}");
+    let log_s = std::fs::read_to_string(&log).unwrap();
+    assert!(log_s.contains("issue create"), "{log_s}");
+    assert!(!log_s.contains("SUPERSECRET123"), "filed issue leaked secret: {log_s}");
+    // Invalid kind is rejected.
+    assert!(mcp::dispatch(&fx.store, "report_create", &serde_json::json!({"repo": fx.repo.to_string_lossy(), "kind": "praise", "title": "x", "body": "y"})).is_err());
+}

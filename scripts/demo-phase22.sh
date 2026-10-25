@@ -135,7 +135,7 @@ EOF
 "$BIN" --repo "$REPO" serve-mcp < "$OUT/mcp1.jsonl" > "$OUT/mcp1-out.jsonl" 2>&1
 TOOLS_LINE="$(grep '"id":1' "$OUT/mcp1-out.jsonl" | head -1)"
 N_TOOLS="$(printf '%s' "$TOOLS_LINE" | grep -o '"name":' | wc -l | tr -d ' ')"
-if [ "$N_TOOLS" = "19" ]; then pass "MCP tools/list advertises 19 tools (incl. changeset_conflicts)"; else fail "MCP tools/list advertises 19 tools (got $N_TOOLS)"; fi
+if [ "$N_TOOLS" = "20" ]; then pass "MCP tools/list advertises 20 tools (incl. changeset_conflicts + report_create)"; else fail "MCP tools/list advertises 20 tools (got $N_TOOLS)"; fi
 grepq "MCP advertises changeset_conflicts" "$OUT/mcp1-out.jsonl" 'changeset_conflicts'
 grepq "MCP changeset_status carries claimed_vs_actual" "$OUT/mcp1-out.jsonl" 'claimed_vs_actual'
 grepq "MCP changeset_status names outside test fn" "$OUT/mcp1-out.jsonl" 'discount_is_tenth'
