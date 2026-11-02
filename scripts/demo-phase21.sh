@@ -14,6 +14,7 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$ROOT/scripts/demo-common.sh"
 BIN="${TOWER_BIN:-$ROOT/target/release/tower}"
 if [ ! -x "$BIN" ]; then
   echo "building release binary..."
@@ -74,9 +75,9 @@ grepq "init registered repo" "$OUT/init.json" '"main_branch": "main"'
 BASE="$(git -C "$REPO" rev-parse main)"
 
 for w in w1 w2 w3; do git -C "$REPO" worktree add -q -b "$w" "$SCRATCH/$w" main; gitc "$SCRATCH/$w"; done
-sed -i 's/hello ${name}/hello ${name.trim()}/' "$SCRATCH/w1/src/greet.ts"
-sed -i 's/return 1;/return 2;/' "$SCRATCH/w2/src/other.ts"
-sed -i 's/hello ${name}/hello ${name.toUpperCase()}/' "$SCRATCH/w3/src/greet.ts"
+edit_fixture_file "$SCRATCH/w1/src/greet.ts" 'hello ${name}' 'hello ${name.trim()}' || exit 1
+edit_fixture_file "$SCRATCH/w2/src/other.ts" 'return 1;' 'return 2;' || exit 1
+edit_fixture_file "$SCRATCH/w3/src/greet.ts" 'hello ${name}' 'hello ${name.toUpperCase()}' || exit 1
 for w in w1 w2 w3; do git -C "$SCRATCH/$w" add -A; git -C "$SCRATCH/$w" commit -qm "$w work"; done
 check "three worktrees forked from same base" test "$(git -C "$SCRATCH/w1" merge-base HEAD "$BASE")" = "$BASE"
 

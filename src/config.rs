@@ -15,6 +15,8 @@ pub struct TowerConfig {
     pub limits: LimitsCfg,
     #[serde(default)]
     pub feedback: FeedbackCfg,
+    #[serde(default)]
+    pub scheduler: SchedulerCfg,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoCfg {
@@ -23,14 +25,31 @@ pub struct RepoCfg {
 }
 fn default_main() -> String { "main".into() }
 impl Default for RepoCfg { fn default() -> Self { Self { main_branch: default_main() } } }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatesCfg {
+    pub check: Option<String>, pub test: Option<String>,
+    #[serde(default)] pub resources: Vec<String>,
+    #[serde(default = "default_gate_timeout")] pub timeout_secs: u64,
+}
+fn default_gate_timeout() -> u64 { 900 }
+impl Default for GatesCfg {
+    fn default() -> Self { Self { check: None, test: None, resources: vec![], timeout_secs: default_gate_timeout() } }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct GatesCfg { pub check: Option<String>, pub test: Option<String> }
+pub struct SchedulerCfg {
+    /// Explicit local executable/argv. Scheduling never supplies sandbox bypass flags.
+    #[serde(default)] pub agent: Option<crate::agent::AgentSpec>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReservedCfg { #[serde(default)] pub paths: Vec<String>, #[serde(default)] pub patterns: Vec<String> }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EscalationCfg { #[serde(default)] pub extra_triggers: Vec<String> }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct LimitsCfg { pub max_concurrent_assignments: Option<u32> }
+pub struct LimitsCfg {
+    pub max_concurrent_assignments: Option<u32>,
+    /// Reconciliation capacity is separate so full worker lanes cannot starve a handoff.
+    #[serde(default)] pub max_concurrent_reconciliations: Option<u32>,
+}
 
 /// Self-reporting target (Phase 2.3): Tower bugs/inefficiencies are filed
 /// as GitHub issues on this repo. `enabled = false` records locally only.
@@ -42,8 +61,8 @@ pub struct FeedbackCfg {
     pub enabled: bool,
 }
 fn default_feedback_repo() -> String { "Holy-Coders/tower".into() }
-fn default_feedback_enabled() -> bool { true }
-impl Default for FeedbackCfg { fn default() -> Self { Self { repo: default_feedback_repo(), enabled: true } } }
+fn default_feedback_enabled() -> bool { false }
+impl Default for FeedbackCfg { fn default() -> Self { Self { repo: default_feedback_repo(), enabled: false } } }
 
 impl TowerConfig {
     pub fn load(repo_root: &Path) -> Self {
@@ -68,7 +87,7 @@ pub fn default_config_text(main_branch: &str, repo_root: &Path) -> String {
     let (check, test) = infer_gates(repo_root);
     let check_line = check.map(|c| format!("check = \"{c}\"")).unwrap_or_else(|| "# check = \"cargo check\"".into());
     let test_line = test.map(|c| format!("test = \"{c}\"")).unwrap_or_else(|| "# test = \"cargo test\"".into());
-    format!("[repo]\nmain_branch = \"{main_branch}\"\n\n[gates]\n{check_line}\n{test_line}\n\n[reserved]\npaths = [\"**/migrations/**\", \"build.rs\", \"**/*.lock\"]\npatterns = [\"macro_rules!\", \"proc_macro\"]\n\n[escalation]\nextra_triggers = []\n\n[limits]\nmax_concurrent_assignments = 4\n\n[feedback]\nrepo = \"Holy-Coders/tower\"\nenabled = true\n")
+    format!("[repo]\nmain_branch = \"{main_branch}\"\n\n[gates]\n{check_line}\n{test_line}\n\n[reserved]\npaths = [\"**/migrations/**\", \"build.rs\", \"**/*.lock\"]\npatterns = [\"macro_rules!\", \"proc_macro\"]\n\n[escalation]\nextra_triggers = []\n\n[limits]\nmax_concurrent_assignments = 4\n\n[feedback]\nrepo = \"Holy-Coders/tower\"\nenabled = false\n")
 }
 
 fn infer_gates(repo_root: &Path) -> (Option<&'static str>, Option<&'static str>) {

@@ -1,4 +1,5 @@
 mod board;
+mod agent;
 mod config;
 mod engine;
 mod feedback;
@@ -7,6 +8,10 @@ mod index;
 mod mcp;
 mod ops;
 mod store;
+mod scheduler;
+mod reconcile;
+mod resources;
+mod process;
 #[cfg(test)]
 mod tests;
 
@@ -50,6 +55,14 @@ enum Command {
     Decisions { #[command(subcommand)] cmd: DecisionsCmd },
     Events { #[arg(long, default_value_t = 0)] since: i64 },
     Lease { #[command(subcommand)] cmd: LeaseCmd },
+    /// Opt-in dependency/agent scheduling (uses the existing orchestrator lease)
+    Schedule { #[command(subcommand)] cmd: ScheduleCmd },
+    /// Cooperative overlap/contract handoff; input is an action-specific JSON file
+    Reconcile { action: String, #[arg(long)] input: Option<PathBuf> },
+    /// Shared gate-resource queue
+    Resources { #[command(subcommand)] cmd: ResourcesCmd },
+    #[command(name = "__agent-runner", hide = true)]
+    AgentRunner { #[arg(long)] run_dir: PathBuf },
     /// Land a landable changeset (fast-forward, or Tower-built candidate; refuses red / non-landable)
     Land { changeset: String },
     /// Report a Tower bug/inefficiency (filed on the feedback repo); `report list` / `report flush` inspect the outbox
@@ -133,6 +146,24 @@ enum ReportCmd {
     Flush,
 }
 
+#[derive(Subcommand)]
+enum ScheduleCmd {
+    Configure { task: String, #[arg(long)] spec: PathBuf },
+    Ready,
+    Status,
+    Tick { #[arg(long)] holder: String },
+    /// Coordinator loop; stop with Ctrl-C and release its named lease explicitly
+    Run { #[arg(long)] holder: String, #[arg(long,default_value_t=2)] interval: u64, #[arg(long)] iterations: Option<usize> },
+    Cancel { task: String },
+}
+#[derive(Subcommand)]
+enum ResourcesCmd {
+    List,
+    Cancel { id: i64 },
+    /// Recover only after independently confirming that the old resource user stopped
+    Recover { id: i64, #[arg(long)] confirmed_stopped: bool },
+}
+
 fn repo_root(cli_repo: &Option<PathBuf>) -> Result<PathBuf> {
     let start = cli_repo.clone().unwrap_or_else(|| std::env::current_dir().unwrap());
     git::repo_root(&start)
@@ -166,6 +197,10 @@ fn command_name(cli: &Cli) -> &'static str {
         Command::Decisions { .. } => "decisions",
         Command::Events { .. } => "events",
         Command::Lease { .. } => "lease",
+        Command::Schedule { .. } => "schedule",
+        Command::Reconcile { .. } => "reconcile",
+        Command::Resources { .. } => "resources",
+        Command::AgentRunner { .. } => "agent-runner",
         Command::Land { .. } => "land",
         Command::Report { .. } => "report",
         Command::ServeMcp => "serve-mcp",
@@ -184,6 +219,9 @@ fn try_registered(store: &Store, cli_repo: &Option<PathBuf>) -> Option<(i64, Pat
 fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().collect();
     let cli = Cli::parse();
+    if let Command::AgentRunner { run_dir } = &cli.command {
+        return agent::run_supervisor(run_dir);
+    }
     let home = config::tower_home();
     let store = Store::open(home)?;
     let op = command_name(&cli);
@@ -204,7 +242,7 @@ fn main() -> Result<()> {
         }
     };
     // Auto-capture is a side effect: it never changes this outcome.
-    if op != "watch" && op != "serve-mcp" && op != "report" {
+    if !matches!(op,"watch"|"serve-mcp"|"report"|"schedule"|"reconcile") {
         if let Some((rid, root, cfg)) = try_registered(&store, &cli.repo) {
             if let Err(e) = &result {
                 feedback::capture_internal_error(&store, rid, &root, &cfg, op, &format!("{e:#}"), &cmdline);
@@ -217,6 +255,42 @@ fn main() -> Result<()> {
 
 fn run(cli: &Cli, store: &Store) -> Result<()> {
     match &cli.command {
+        Command::AgentRunner { .. } => unreachable!("agent runner is dispatched before opening state"),
+        Command::Schedule { cmd } => {
+            let (rid,root,cfg)=registered(store,&cli.repo)?;
+            match cmd {
+                ScheduleCmd::Configure{task,spec}=>print_json(&scheduler::configure(store,rid,task,&serde_json::from_slice(&std::fs::read(spec)?)?)?),
+                ScheduleCmd::Ready=>print_json(&scheduler::ready(store,rid,&cfg)?),
+                ScheduleCmd::Status=>print_json(&scheduler::status(store,rid,&cfg)?),
+                ScheduleCmd::Tick{holder}=>print_json(&scheduler::tick(store,rid,&root,&cfg,holder)?),
+                ScheduleCmd::Cancel{task}=>print_json(&scheduler::cancel(store,rid,task)?),
+                ScheduleCmd::Run{holder,interval,iterations}=>{
+                    let mut n=0;
+                    while iterations.is_none_or(|limit|n<limit) {
+                        print_json(&scheduler::tick(store,rid,&root,&cfg,holder)?);
+                        n+=1;
+                        if iterations.is_some_and(|limit|n>=limit) {break;}
+                        std::thread::sleep(std::time::Duration::from_secs((*interval).clamp(1,60)));
+                    }
+                }
+            }
+            Ok(())
+        }
+        Command::Reconcile{action,input}=>{
+            let (rid,root,cfg)=registered(store,&cli.repo)?;
+            let args=match input {Some(p)=>serde_json::from_slice(&std::fs::read(p)?)?,None=>serde_json::json!({})};
+            print_json(&reconcile::dispatch(store,rid,&root,&cfg,action,&args)?);
+            Ok(())
+        }
+        Command::Resources{cmd}=>{
+            let (rid,_,_)=registered(store,&cli.repo)?;
+            match cmd {
+                ResourcesCmd::List=>print_json(&serde_json::to_value(resources::list(store,Some(rid))?)?),
+                ResourcesCmd::Cancel{id}=>print_json(&serde_json::to_value(resources::cancel(store,rid,*id)?)?),
+                ResourcesCmd::Recover{id,confirmed_stopped}=>print_json(&serde_json::to_value(resources::recover(store,rid,*id,*confirmed_stopped)?)?),
+            }
+            Ok(())
+        }
         Command::Init { write_config, main_branch } => {
             let root = repo_root(&cli.repo)?;
             let canon = git::canonical_str(&root);
@@ -253,6 +327,7 @@ fn run(cli: &Cli, store: &Store) -> Result<()> {
                 TaskCmd::Create { title, brief } => { let t = store.create_task(rid, title, brief)?; print_json(&serde_json::json!({"task_id": t.id, "state": t.state})); }
                 TaskCmd::Show { id } => { let t = store.get_task(rid, id)?.with_context(|| format!("unknown task {id}"))?; print_json(&serde_json::json!(t)); }
                 TaskCmd::Kill { id } => {
+                    scheduler::cancel(store,rid,id)?;
                     for a in store.list_assignments(rid)?.into_iter().filter(|a| a.task_id == *id && a.state == "open") { store.close_assignment(rid, &a.id)?; }
                     store.set_task_state(rid, id, "failed")?;
                     print_json(&serde_json::json!({"task_id": id, "state": "failed"}));

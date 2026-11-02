@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::config::TowerConfig;
 use crate::git;
 use crate::index;
+use crate::resources::{self, Reservation, ResourceGuard};
 use crate::store::{ClaimNode, Store};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,7 +90,19 @@ pub fn radar_scan(store: &Store, repo: &Path, cfg: &TowerConfig) -> Result<Radar
         if canon == scratch || canon == landing { continue; }
         match scan_worktree(repo, wt, cfg) { Ok(s) => scans.push(s), Err(e) => eprintln!("tower: scan {} failed: {e}", wt.path) }
     }
-    let excluded: std::collections::HashSet<usize> = scans.iter().enumerate().filter(|(_, s)| superseded_only.contains(&crate::git::canonical_str(Path::new(&s.path)))).map(|(i, _)| i).collect();
+    let mut excluded: std::collections::HashSet<usize> = scans.iter().enumerate().filter(|(_, s)| superseded_only.contains(&crate::git::canonical_str(Path::new(&s.path)))).map(|(i, _)| i).collect();
+    let mut reconciliation_suspended = std::collections::HashSet::new();
+    if let Some(registered) = store.repo_by_path(&canon_repo)? {
+        let assignments = store.list_assignments(registered.id)?;
+        for (i, scan) in scans.iter().enumerate() {
+            for assignment in assignments.iter().filter(|a| git::canonical_str(Path::new(&a.worktree_path)) == git::canonical_str(Path::new(&scan.path))) {
+                let snapshot = git::snapshot_commit(Path::new(&scan.path))?;
+                if crate::reconcile::changeset_suspended(store, registered.id, &assignment.id, &snapshot)? {
+                    excluded.insert(i); reconciliation_suspended.insert(i); break;
+                }
+            }
+        }
+    }
     // Pairwise + vs main (skip main worktree itself when snapshot == main head and no files)
     let mut collisions = Vec::new();
     let mut red_map: std::collections::HashMap<usize, Vec<String>> = std::collections::HashMap::new();
@@ -117,6 +130,7 @@ pub fn radar_scan(store: &Store, repo: &Path, cfg: &TowerConfig) -> Result<Radar
         }
     }
     for (i, s) in scans.iter_mut().enumerate() {
+        if reconciliation_suspended.contains(&i) { s.status = "yellow".into(); s.reasons = vec!["shared reconciliation pending — excluded from radar pairing until the verified result is merged unchanged".into()]; continue; }
         if excluded.contains(&i) { s.status = "green".into(); s.reasons = vec!["superseded changeset worktree — excluded from radar pairing".into()]; continue; }
         if let Some(reasons) = red_map.get(&i) { s.status = "red".into(); s.reasons = reasons.clone(); }
         else if s.files.is_empty() { s.status = "green".into(); s.reasons = vec!["no changes vs merge-base".into()]; }
@@ -126,12 +140,13 @@ pub fn radar_scan(store: &Store, repo: &Path, cfg: &TowerConfig) -> Result<Radar
 }
 
 pub fn label_for(store: &Store, repo_id: i64, wt_path: &str) -> String {
+    let canonical = git::canonical_str(Path::new(wt_path));
     if let Ok(list) = store.list_changesets(repo_id) {
         // latest non-superseded changeset for this worktree
-        if let Some(c) = list.iter().rev().find(|c| c.worktree_path == wt_path && !is_superseded(c)) { return c.id.clone(); }
+        if let Some(c) = list.iter().rev().find(|c| git::canonical_str(Path::new(&c.worktree_path)) == canonical && !is_superseded(c)) { return c.id.clone(); }
     }
     if let Ok(list) = store.list_assignments(repo_id) {
-        if let Some(a) = list.iter().find(|a| a.worktree_path == wt_path && a.state == "open") { return a.id.clone(); }
+        if let Some(a) = list.iter().find(|a| git::canonical_str(Path::new(&a.worktree_path)) == canonical && a.state == "open") { return a.id.clone(); }
     }
     wt_path.to_string()
 }
@@ -251,17 +266,6 @@ pub fn gate_proof_current(g: &crate::store::GateRunRow, snapshots: &std::collect
 
 pub const STALE_REASON: &str = "gate proof stale (source, peer, or main changed) — rerun gates";
 
-pub fn run_shell(dir: &Path, cmd: &str) -> (bool, String) {
-    match std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(dir).output() {
-        Ok(o) => {
-            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
-            s.push_str(&String::from_utf8_lossy(&o.stderr));
-            if s.len() > 8000 { s = format!("{}...[truncated]", &s[..8000]); }
-            (o.status.success(), s)
-        }
-        Err(e) => (false, e.to_string()),
-    }
-}
 
 pub fn scratch_dir(store: &Store, repo_path: &str) -> PathBuf {
     store.home.join("worktrees").join(crate::config::repo_hash(repo_path)).join("rehearsal")
@@ -315,12 +319,20 @@ pub fn integration_order(store: &Store, repo_id: i64) -> Result<Vec<serde_json::
     let mut out = Vec::new();
     for c in store.list_changesets(repo_id)? {
         if landed.contains(&c.id) || is_superseded(&c) { continue; }
+        let wt = Path::new(&c.worktree_path);
+        let snapshot = if wt.exists() { git::snapshot_commit(wt)? } else { c.head_commit.clone() };
+        if crate::reconcile::changeset_suspended(store, repo_id, &c.assignment_id, &snapshot)? { continue; }
         out.push(serde_json::json!({"changeset_id": c.id, "task_id": c.task_id, "assignment_id": c.assignment_id, "reason": "creation order (no declared dependencies)"}));
     }
     Ok(out)
 }
 
 pub fn rehearse(store: &Store, repo_id: i64, repo: &Path, cfg: &TowerConfig, tiers: &[i64]) -> Result<serde_json::Value> {
+    let key = format!("rehearse:{tiers:?}");
+    let mut reservation = match resources::acquire(store, repo_id, &key, &resources::resource_names(repo_id, cfg), serde_json::json!({"operation": "rehearse", "tiers": tiers}))? {
+        Reservation::Acquired(guard) => guard,
+        Reservation::Queued(job) => return Ok(resources::queued_receipt(&job)),
+    };
     let mh = main_head(repo, cfg)?;
     let scratch = ensure_scratch(store, repo, cfg)?;
     store.emit(repo_id, "rehearsal_started", serde_json::json!({"scratch": scratch.to_string_lossy()}))?;
@@ -355,8 +367,8 @@ pub fn rehearse(store: &Store, repo_id: i64, repo: &Path, cfg: &TowerConfig, tie
     for tier in tiers {
         let cmd = match tier { 1 => cfg.gates.check.clone(), 2 => cfg.gates.test.clone(), _ => None };
         let Some(cmd) = cmd else { gate_results.push(serde_json::json!({"tier": tier, "skipped": true, "reason": "not configured"})); continue; };
-        let (passed, output) = run_shell(&scratch, &cmd);
-        gate_results.push(serde_json::json!({"tier": tier, "command": cmd, "passed": passed, "output_tail": tail(&output, 2000), "attributed_to": merged_ids, "tree_hash": tree_hash, "main_head": mh, "participants": participants_json}));
+        let (passed, output) = reservation.run_gate(&scratch, &cmd, cfg.gates.timeout_secs)?;
+        gate_results.push(serde_json::json!({"tier": tier, "command": cmd, "passed": passed, "resource_job_id": reservation.id, "output_tail": tail(&output, 2000), "attributed_to": merged_ids, "tree_hash": tree_hash, "main_head": mh, "participants": participants_json}));
         for cid in &merged_ids {
             store.record_gate_with_proof(repo_id, cid, *tier, &cmd, passed, &output, Some(&tree_hash), Some(&mh), Some(&participants_json))?;
         }
@@ -366,14 +378,24 @@ pub fn rehearse(store: &Store, repo_id: i64, repo: &Path, cfg: &TowerConfig, tie
     // Refresh changeset statuses from simulation + gates
     refresh_changeset_statuses(store, repo_id, repo, cfg)?;
     store.emit(repo_id, "rehearsal_finished", serde_json::json!({"integration_head": new_head}))?;
-    Ok(serde_json::json!({"scratch": scratch.to_string_lossy(), "integration_head": new_head, "order": order, "merges": results, "gates": gate_results}))
+    Ok(serde_json::json!({"scratch": scratch.to_string_lossy(), "resource_job_id": reservation.id, "integration_head": new_head, "order": order, "merges": results, "gates": gate_results}))
 }
 
-fn tail(s: &str, n: usize) -> String { if s.len() <= n { s.to_string() } else { s[s.len() - n..].to_string() } }
+fn tail(s: &str, n: usize) -> String {
+    let mut start = s.len().saturating_sub(n);
+    while !s.is_char_boundary(start) { start += 1; }
+    s[start..].to_string()
+}
 
 pub fn gate_run_single(store: &Store, repo_id: i64, repo: &Path, cfg: &TowerConfig, changeset_id: &str, tier: i64) -> Result<serde_json::Value> {
+    if tier != 1 && tier != 2 { bail!("gate tier must be 1 or 2"); }
     let cs0 = store.get_changeset(repo_id, changeset_id)?.with_context(|| format!("unknown changeset {changeset_id}"))?;
     if is_superseded(&cs0) { bail!("changeset {changeset_id} is superseded; gates are not run for it"); }
+    let key = format!("gate:{changeset_id}:{tier}");
+    let mut reservation = match resources::acquire(store, repo_id, &key, &resources::resource_names(repo_id, cfg), serde_json::json!({"operation": "gate", "changeset_id": changeset_id, "tier": tier}))? {
+        Reservation::Acquired(guard) => guard,
+        Reservation::Queued(job) => return Ok(resources::queued_receipt(&job)),
+    };
     let mh = main_head(repo, cfg)?;
     let scratch = ensure_scratch(store, repo, cfg)?;
     // rehearsal merges up to and including this changeset
@@ -404,13 +426,13 @@ pub fn gate_run_single(store: &Store, repo_id: i64, repo: &Path, cfg: &TowerConf
     }
     let cmd = match tier { 1 => cfg.gates.check.clone(), 2 => cfg.gates.test.clone(), _ => None };
     let Some(cmd) = cmd else { return Ok(serde_json::json!({"changeset_id": changeset_id, "tier": tier, "skipped": true, "reason": "tier not configured — Tier-0 simulation only"})); };
-    let (passed, output) = run_shell(&scratch, &cmd);
+    let (passed, output) = reservation.run_gate(&scratch, &cmd, cfg.gates.timeout_secs)?;
     let tree_hash = git::rev_parse(&scratch, "HEAD^{tree}").unwrap_or_default();
     let participants_json = participants_value(&participants);
     store.record_gate_with_proof(repo_id, changeset_id, tier, &cmd, passed, &output, Some(&tree_hash), Some(&mh), Some(&participants_json))?;
     refresh_changeset_statuses(store, repo_id, repo, cfg)?;
     let cs = store.get_changeset(repo_id, changeset_id)?.unwrap();
-    Ok(serde_json::json!({"changeset_id": changeset_id, "tier": tier, "command": cmd, "passed": passed, "output_tail": tail(&output, 2000), "status": cs.status, "reasons": serde_json::from_str::<serde_json::Value>(&cs.reasons_json).unwrap_or_default()}))
+    Ok(serde_json::json!({"changeset_id": changeset_id, "tier": tier, "command": cmd, "passed": passed, "resource_job_id": reservation.id, "output_tail": tail(&output, 2000), "status": cs.status, "reasons": serde_json::from_str::<serde_json::Value>(&cs.reasons_json).unwrap_or_default()}))
 }
 
 pub fn refresh_changeset_statuses(store: &Store, repo_id: i64, repo: &Path, cfg: &TowerConfig) -> Result<()> {
@@ -418,7 +440,17 @@ pub fn refresh_changeset_statuses(store: &Store, repo_id: i64, repo: &Path, cfg:
     let landed = landed_ids(store, repo_id);
     let changesets = store.list_changesets(repo_id)?;
     // Active set, in integration (creation) order: landed and superseded are out.
-    let active: Vec<&crate::store::ChangesetRow> = changesets.iter().filter(|c| !landed.contains(&c.id) && !is_superseded(c)).collect();
+    let mut active: Vec<&crate::store::ChangesetRow> = Vec::new();
+    for c in &changesets {
+        if landed.contains(&c.id) || is_superseded(c) { continue; }
+        let wt = Path::new(&c.worktree_path);
+        let snapshot = if wt.exists() { git::snapshot_commit(wt)? } else { c.head_commit.clone() };
+        if crate::reconcile::changeset_suspended(store, repo_id, &c.assignment_id, &snapshot)? {
+            store.update_changeset_status(repo_id, &c.id, "yellow", &serde_json::json!(["shared reconciliation pending — wait for the verified result, then merge it and validate the consumer"]))?;
+            continue;
+        }
+        active.push(c);
+    }
     let position: std::collections::HashMap<String, usize> = active.iter().enumerate().map(|(i, c)| (c.id.clone(), i)).collect();
     // Live snapshot, head, base, and claimed-vs-actual per changeset (F2:
     // CVA is recomputed from live claims and the live diff, not frozen).
@@ -426,14 +458,21 @@ pub fn refresh_changeset_statuses(store: &Store, repo_id: i64, repo: &Path, cfg:
     let mut live: std::collections::HashMap<String, Live> = std::collections::HashMap::new();
     for c in &active {
         let wt = PathBuf::from(&c.worktree_path);
-        let (snap, head) = if wt.exists() {
-            (git::snapshot_commit(&wt).unwrap_or_else(|_| c.head_commit.clone()), git::rev_parse(&wt, "HEAD").unwrap_or_else(|_| c.head_commit.clone()))
-        } else { (c.head_commit.clone(), c.head_commit.clone()) };
+        let (snap, head, snapshot_proven) = if wt.exists() {
+            let snapshot = git::snapshot_commit(&wt).ok();
+            let proven = snapshot.is_some();
+            (snapshot.unwrap_or_else(|| c.head_commit.clone()), git::rev_parse(&wt, "HEAD").unwrap_or_else(|_| c.head_commit.clone()), proven)
+        } else { (c.head_commit.clone(), c.head_commit.clone(), true) };
         let base = git::merge_base(repo, &mh, &snap).unwrap_or_else(|_| c.base_commit.clone());
         let cva = if wt.exists() {
             match live_diff(repo, &wt, &base) {
                 Ok((files, items_json, changed_items)) => {
-                    let claimed = store.claims_for(repo_id, &c.assignment_id).unwrap_or_default();
+                    let mut claimed = store.claims_for(repo_id, &c.assignment_id)?;
+                    if snapshot_proven {
+                        // Returned implementation coverage validates its exact source;
+                        // it does not grant this assignment permission to edit it.
+                        claimed.extend(crate::reconcile::returned_coverage(store, repo_id, &c.assignment_id, &snap)?);
+                    }
                     let cva = claimed_vs_actual(&claimed, &files, &changed_items);
                     let files_v = serde_json::json!(files);
                     let items_v = serde_json::json!(items_json);
@@ -548,7 +587,17 @@ pub(crate) enum Candidate {
 /// Build (or rebuild) the landing candidate for one changeset in the
 /// Tower-owned landing scratch and run gates on it (F5). Worker and main
 /// worktrees are never touched here.
+#[cfg(test)]
 pub(crate) fn build_landing_candidate(store: &Store, repo_id: i64, repo: &Path, cfg: &TowerConfig, changeset_id: &str, source_head: &str, based_main: &str, record_gates: bool) -> Result<Candidate> {
+    let key = format!("candidate:{changeset_id}");
+    let mut reservation = match resources::acquire(store, repo_id, &key, &resources::resource_names(repo_id, cfg), serde_json::json!({"operation": "candidate", "changeset_id": changeset_id}))? {
+        Reservation::Acquired(guard) => guard,
+        Reservation::Queued(job) => bail!("landing candidate queued: {}", resources::queued_receipt(&job)),
+    };
+    build_landing_candidate_reserved(store, repo_id, repo, cfg, changeset_id, source_head, based_main, record_gates, &mut reservation)
+}
+
+fn build_landing_candidate_reserved(store: &Store, repo_id: i64, repo: &Path, cfg: &TowerConfig, changeset_id: &str, source_head: &str, based_main: &str, record_gates: bool, reservation: &mut ResourceGuard<'_>) -> Result<Candidate> {
     let scratch = ensure_landing_scratch(store, repo, based_main)?;
     let (code, out, err) = git::run_git_raw(&scratch, &["-c", "user.name=Tower", "-c", "user.email=tower@local", "merge", "--no-edit", source_head]);
     if code != 0 {
@@ -569,8 +618,8 @@ pub(crate) fn build_landing_candidate(store: &Store, repo_id: i64, repo: &Path, 
     let mut gate_results = Vec::new();
     for (tier, cmd) in [(1i64, cfg.gates.check.clone()), (2i64, cfg.gates.test.clone())] {
         let Some(cmd) = cmd else { continue };
-        let (passed, output) = run_shell(&scratch, &cmd);
-        gate_results.push(serde_json::json!({"tier": tier, "command": cmd, "passed": passed, "output_tail": tail(&output, 2000), "tree_hash": tree_hash, "main_head": based_main, "participants": participants}));
+        let (passed, output) = reservation.run_gate(&scratch, &cmd, cfg.gates.timeout_secs)?;
+        gate_results.push(serde_json::json!({"tier": tier, "command": cmd, "passed": passed, "resource_job_id": reservation.id, "output_tail": tail(&output, 2000), "tree_hash": tree_hash, "main_head": based_main, "participants": participants}));
         if record_gates { store.record_gate_with_proof(repo_id, changeset_id, tier, &cmd, passed, &output, Some(&tree_hash), Some(based_main), Some(&participants))?; }
         if !passed { return Ok(Candidate::GateFailed { tier, command: cmd, output, tree_hash }); }
     }
@@ -630,8 +679,15 @@ fn finalize_landing(store: &Store, repo_id: i64, repo: &Path, cfg: &TowerConfig,
 }
 
 pub fn land_changeset(store: &Store, repo_id: i64, repo: &Path, cfg: &TowerConfig, changeset_id: &str) -> Result<serde_json::Value> {
+    store.get_changeset(repo_id, changeset_id)?.with_context(|| format!("unknown changeset {changeset_id}"))?;
+    let key = format!("land:{changeset_id}");
+    let mut reservation = match resources::acquire(store, repo_id, &key, &resources::resource_names(repo_id, cfg), serde_json::json!({"operation": "land", "changeset_id": changeset_id}))? {
+        Reservation::Acquired(guard) => guard,
+        Reservation::Queued(job) => return Ok(resources::queued_receipt(&job)),
+    };
     refresh_changeset_statuses(store, repo_id, repo, cfg)?;
     let cs = store.get_changeset(repo_id, changeset_id)?.with_context(|| format!("unknown changeset {changeset_id}"))?;
+    crate::reconcile::ensure_no_unresolved_stubs(store, repo_id, &cs.assignment_id)?;
     if landed_ids(store, repo_id).contains(&cs.id) { bail!("changeset {} has already landed", cs.id); }
     if !changeset_landable(&cs) {
         bail!("refusing to land non-green changeset {} (status={}, not landable, reasons={})", cs.id, cs.status, cs.reasons_json);
@@ -655,7 +711,7 @@ pub fn land_changeset(store: &Store, repo_id: i64, repo: &Path, cfg: &TowerConfi
     for attempt in 0..2 {
         let based_main = main_head(repo, cfg)?;
         let src = committed_source_head(&cs)?;
-        match build_landing_candidate(store, repo_id, repo, cfg, &cs.id, &src, &based_main, true)? {
+        match build_landing_candidate_reserved(store, repo_id, repo, cfg, &cs.id, &src, &based_main, true, &mut reservation)? {
             Candidate::Conflict { files } => {
                 let files_s = if files.is_empty() { "(unmerged files unavailable)".to_string() } else { files.join(",") };
                 store.update_changeset_status(repo_id, &cs.id, "red", &serde_json::json!([format!("conflicts with {} in {}", main_br, files_s)]))?;
@@ -695,7 +751,9 @@ pub fn register_changeset(store: &Store, repo_id: i64, repo: &Path, cfg: &TowerC
     let head = crate::git::rev_parse(&wt, "HEAD")?;
     let base = crate::git::merge_base(&wt, &mh, &head).unwrap_or(mh);
     let (files, items_json, changed_items) = live_diff(repo, &wt, &base)?;
-    let claimed = store.claims_for(repo_id, assignment_id)?;
+    let snapshot = git::snapshot_commit(&wt)?;
+    let mut claimed = store.claims_for(repo_id, assignment_id)?;
+    claimed.extend(crate::reconcile::returned_coverage(store, repo_id, assignment_id, &snapshot)?);
     let cva = claimed_vs_actual(&claimed, &files, &changed_items);
     let outside = outside_claim(&cva);
     let (status, reasons) = if outside { ("yellow", vec![outside_reason(&cva)]) }
@@ -727,7 +785,9 @@ pub fn refresh_changeset(store: &Store, repo_id: i64, repo: &Path, cfg: &TowerCo
     let base = git::merge_base(repo, &mh, &head).unwrap_or_else(|_| cs.base_commit.clone());
     let (files_v, items_v, cva) = if wt.exists() {
         let (files, items_json, changed_items) = live_diff(repo, &wt, &base)?;
-        let claimed = store.claims_for(repo_id, &cs.assignment_id)?;
+        let snapshot = git::snapshot_commit(&wt)?;
+        let mut claimed = store.claims_for(repo_id, &cs.assignment_id)?;
+        claimed.extend(crate::reconcile::returned_coverage(store, repo_id, &cs.assignment_id, &snapshot)?);
         let cva = claimed_vs_actual(&claimed, &files, &changed_items);
         (serde_json::json!(files), serde_json::json!(items_json), cva)
     } else {
@@ -769,8 +829,9 @@ pub fn changeset_conflicts(store: &Store, repo_id: i64, repo: &Path, cfg: &Tower
     let cs = store.get_changeset(repo_id, changeset_id)?.with_context(|| format!("unknown changeset {changeset_id}"))?;
     let empty = serde_json::json!({"changeset_id": cs.id, "conflicts": []});
     if landed_ids(store, repo_id).contains(&cs.id) || is_superseded(&cs) { return Ok(empty); }
-    let landed = landed_ids(store, repo_id);
-    let active: Vec<crate::store::ChangesetRow> = store.list_changesets(repo_id)?.into_iter().filter(|c| !landed.contains(&c.id) && !is_superseded(c)).collect();
+    let ordered_ids: std::collections::HashSet<String> = integration_order(store, repo_id)?.into_iter()
+        .filter_map(|entry| entry["changeset_id"].as_str().map(str::to_string)).collect();
+    let active: Vec<crate::store::ChangesetRow> = store.list_changesets(repo_id)?.into_iter().filter(|c| ordered_ids.contains(&c.id)).collect();
     let Some(my_pos) = active.iter().position(|c| c.id == cs.id) else { return Ok(empty) };
     let mh = main_head(repo, cfg)?;
     let my_snap = live_snapshot(&cs);

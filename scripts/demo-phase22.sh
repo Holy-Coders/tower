@@ -18,6 +18,7 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$ROOT/scripts/demo-common.sh"
 BIN="${TOWER_BIN:-$ROOT/target/release/tower}"
 if [ ! -x "$BIN" ]; then
   echo "building release binary..."
@@ -91,8 +92,8 @@ grepq "init registered repo" "$OUT/init.json" '"main_branch": "main"'
 echo "== step 2 (B+C): claim one test fn, edit the other + an unclaimed file =="
 git -C "$REPO" worktree add -q -b w1 "$SCRATCH/w1" main; gitc "$SCRATCH/w1"
 # Edit only discount_is_tenth inside #[cfg(test)] mod tests, and notify().
-sed -i 's/discount(100), 10/discount(200), 20/' "$SCRATCH/w1/src/orders.rs"
-sed -i 's/notify: /sent: /' "$SCRATCH/w1/src/notify.rs"
+edit_fixture_file "$SCRATCH/w1/src/orders.rs" 'discount(100), 10' 'discount(200), 20' || exit 1
+edit_fixture_file "$SCRATCH/w1/src/notify.rs" 'notify: ' 'sent: ' || exit 1
 git -C "$SCRATCH/w1" add -A; git -C "$SCRATCH/w1" commit -qm "w1 work"
 check "w1 worktree committed" git -C "$SCRATCH/w1" rev-parse HEAD
 TW task create "extend discount test and notify wording" --brief b > "$OUT/t1.json" 2>&1
@@ -135,7 +136,7 @@ EOF
 "$BIN" --repo "$REPO" serve-mcp < "$OUT/mcp1.jsonl" > "$OUT/mcp1-out.jsonl" 2>&1
 TOOLS_LINE="$(grep '"id":1' "$OUT/mcp1-out.jsonl" | head -1)"
 N_TOOLS="$(printf '%s' "$TOOLS_LINE" | grep -o '"name":' | wc -l | tr -d ' ')"
-if [ "$N_TOOLS" = "20" ]; then pass "MCP tools/list advertises 20 tools (incl. changeset_conflicts + report_create)"; else fail "MCP tools/list advertises 20 tools (got $N_TOOLS)"; fi
+if [ "$N_TOOLS" = "23" ]; then pass "MCP tools/list advertises 23 tools (incl. changeset_conflicts + report_create)"; else fail "MCP tools/list advertises 23 tools (got $N_TOOLS)"; fi
 grepq "MCP advertises changeset_conflicts" "$OUT/mcp1-out.jsonl" 'changeset_conflicts'
 grepq "MCP changeset_status carries claimed_vs_actual" "$OUT/mcp1-out.jsonl" 'claimed_vs_actual'
 grepq "MCP changeset_status names outside test fn" "$OUT/mcp1-out.jsonl" 'discount_is_tenth'
@@ -182,8 +183,8 @@ eq "assignment close released every A-1 claim" "$(grep -c '"assignment_id": "A-1
 echo "== step 4 (D): conflicting pair, merge-tree hunk detail without raw git =="
 for w in w2 w3; do git -C "$REPO" worktree add -q -b "$w" "$SCRATCH/$w" main; gitc "$SCRATCH/$w"; done
 check "w2/w3 worktrees forked from post-land main" test -d "$SCRATCH/w3/src"
-sed -i 's/items.iter().sum()/items.iter().sum::<i64>() + 0/' "$SCRATCH/w2/src/orders.rs"
-sed -i 's/items.iter().sum()/items.iter().fold(0, |a, b| a + b)/' "$SCRATCH/w3/src/orders.rs"
+edit_fixture_file "$SCRATCH/w2/src/orders.rs" 'items.iter().sum()' 'items.iter().sum::<i64>() + 0' || exit 1
+edit_fixture_file "$SCRATCH/w3/src/orders.rs" 'items.iter().sum()' 'items.iter().fold(0, |a, b| a + b)' || exit 1
 for w in w2 w3; do git -C "$SCRATCH/$w" add -A; git -C "$SCRATCH/$w" commit -qm "$w work"; done
 TW task create "total via turbofish sum" --brief b > "$OUT/t2.json" 2>&1
 TW task create "total via fold" --brief b > "$OUT/t3.json" 2>&1

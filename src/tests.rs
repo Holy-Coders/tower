@@ -38,7 +38,7 @@ struct Fixture {
 /// gate; registered in a store whose home is inside the temp dir.
 fn fixture(with_gates: bool) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().to_path_buf();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
     let repo = root.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     git_ok(&repo, &["init", "-b", "main"]);
@@ -95,6 +95,22 @@ fn status(fx: &Fixture, cid: &str) -> String {
 }
 
 // ---------- store ----------
+
+#[test]
+#[cfg(unix)]
+fn board_labels_resolve_worktree_symlink_aliases() {
+    let fx = fixture(false);
+    let worker = add_worktree(&fx, "worker", "worker");
+    let alias = fx.root.join("worker-alias");
+    std::os::unix::fs::symlink(&worker, &alias).unwrap();
+    let task = fx.store.create_task(fx.rid, "alias", "").unwrap();
+    let assignment = fx.store.create_assignment(fx.rid, &task.id, &worker.to_string_lossy(), "worker").unwrap();
+    assert_eq!(engine::label_for(&fx.store, fx.rid, &alias.to_string_lossy()), assignment.id);
+    replace_in(&worker.join("src/other.ts"), "return 1;", "return 2;");
+    commit_all(&worker, "worker change");
+    let result = engine::register_changeset(&fx.store, fx.rid, &fx.repo, &fx.cfg, &assignment.id, &worker.to_string_lossy()).unwrap();
+    assert_eq!(engine::label_for(&fx.store, fx.rid, &alias.to_string_lossy()), result["changeset_id"].as_str().unwrap());
+}
 
 #[test]
 fn ids_are_sequential_per_repo_with_documented_prefixes() {
@@ -466,7 +482,7 @@ fn mcp_tools_mirror_the_cli_surface() {
     assert!(mcp::dispatch(&fx.store, "not_a_tool", &serde_json::json!({"repo": repo_s})).is_err());
     // tools/list advertises the 16 spec tools + Phase 2.1
     // changeset_refresh/supersede + Phase 2.2 changeset_conflicts.
-    assert_eq!(mcp::tool_defs().as_array().unwrap().len(), 20);
+    assert_eq!(mcp::tool_defs().as_array().unwrap().len(), 23);
 }
 
 // ---------- merge simulation primitive ----------
@@ -1109,7 +1125,7 @@ fn scrubbing_redacts_fake_secret_and_strips_home() {
 fn feedback_config_defaults_and_parsing() {
     let d = TowerConfig::default();
     assert_eq!(d.feedback.repo, "Holy-Coders/tower");
-    assert!(d.feedback.enabled);
+    assert!(!d.feedback.enabled);
     let tmp = tempfile::tempdir().unwrap();
     write(&tmp.path().join("tower.toml"), "[feedback]\nrepo = \"acme/widgets\"\nenabled = false\n");
     let cfg = TowerConfig::load(tmp.path());
@@ -1118,7 +1134,7 @@ fn feedback_config_defaults_and_parsing() {
     write(&tmp.path().join("tower.toml"), "[feedback]\nrepo = \"acme/only\"\n");
     let cfg2 = TowerConfig::load(tmp.path());
     assert_eq!(cfg2.feedback.repo, "acme/only");
-    assert!(cfg2.feedback.enabled, "partial [feedback] keeps enabled default");
+    assert!(!cfg2.feedback.enabled, "partial [feedback] stays opt-in");
 }
 
 #[test]
@@ -1220,7 +1236,7 @@ fn slow_and_internal_capture_classification() {
 fn mcp_report_create_is_tool_20_and_files_via_stub() {
     let defs = mcp::tool_defs();
     let arr = defs.as_array().unwrap();
-    assert_eq!(arr.len(), 20);
+    assert_eq!(arr.len(), 23);
     let rc = arr.iter().find(|t| t["name"] == serde_json::json!("report_create")).expect("report_create advertised");
     let desc = rc["description"].as_str().unwrap();
     assert!(desc.contains("Do NOT report bugs in the code you are orchestrating"), "{desc}");
@@ -1228,6 +1244,7 @@ fn mcp_report_create_is_tool_20_and_files_via_stub() {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = ENV_LOCK.lock().unwrap();
     let fx = fixture(false);
+    write(&fx.repo.join("tower.toml"), "[feedback]\nenabled = true\n");
     let (gh, log) = stub_gh(&fx.root.join("mcp"), "ok", "[]");
     std::env::set_var("TOWER_GH", &gh);
     let repo_s = fx.repo.to_string_lossy().into_owned();

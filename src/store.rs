@@ -52,6 +52,7 @@ impl Store {
         std::fs::create_dir_all(&home).with_context(|| format!("create {}", home.display()))?;
         let db = home.join("tower.db");
         let conn = Connection::open(&db)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let s = Self { conn, home };
         s.migrate()?;
@@ -86,7 +87,18 @@ impl Store {
         self.add_column_if_missing("gate_runs", "tree_hash", "TEXT")?;
         self.add_column_if_missing("gate_runs", "main_head", "TEXT")?;
         self.add_column_if_missing("gate_runs", "participants_json", "TEXT")?;
+        crate::scheduler::migrate(self)?;
+        crate::resources::migrate(self)?;
+        crate::reconcile::migrate(self)?;
         Ok(())
+    }
+    /// Serialize a coordination decision and its events across CLI/MCP processes.
+    pub fn atomic<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        if !self.conn.is_autocommit() { return f(); }
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+        let value = f()?;
+        tx.commit()?;
+        Ok(value)
     }
     fn add_column_if_missing(&self, table: &str, column: &str, decl: &str) -> Result<()> {
         let mut st = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -167,6 +179,9 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
     pub fn close_assignment(&self, repo_id: i64, id: &str) -> Result<()> {
+        if !crate::scheduler::assignment_is_quiescent(self,repo_id,id)? {
+            anyhow::bail!("assignment {id} still has a live or uncertain agent; cancel it and wait for a terminal receipt before closing");
+        }
         self.conn.execute("UPDATE assignments SET state='closed' WHERE repo_id=?1 AND id=?2", params![repo_id, id])?;
         self.conn.execute("DELETE FROM claims WHERE repo_id=?1 AND assignment_id=?2", params![repo_id, id])?;
         self.emit(repo_id, "assignment_closed", serde_json::json!({"assignment_id": id}))?;
@@ -187,6 +202,7 @@ impl Store {
                 }
             }
         }
+        out.extend(crate::reconcile::claim_blockers(self, repo_id, assignment_id, nodes)?);
         Ok(out)
     }
     fn collisions_for_node(collisions: &[serde_json::Value], node: &ClaimNode) -> bool {
@@ -196,6 +212,9 @@ impl Store {
     /// refused by name. `granted` (all-or-nothing) is derived by callers as
     /// `refused.is_empty()`.
     pub fn acquire_claims_partial(&self, repo_id: i64, assignment_id: &str, nodes: &[ClaimNode]) -> Result<PartialClaimResult> {
+        self.atomic(|| self.acquire_claims_partial_inner(repo_id, assignment_id, nodes))
+    }
+    fn acquire_claims_partial_inner(&self, repo_id: i64, assignment_id: &str, nodes: &[ClaimNode]) -> Result<PartialClaimResult> {
         let cols = self.claim_collisions(repo_id, assignment_id, nodes)?;
         let already = self.claims_for(repo_id, assignment_id)?;
         let mut granted_nodes = Vec::new();

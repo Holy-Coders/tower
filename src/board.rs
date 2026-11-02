@@ -24,7 +24,8 @@ pub fn next_action(status: &str, reasons: &[String], landed: bool, superseded: b
             } else { "resolve conflict".to_string() }
         }
         "yellow" => {
-            if reasons.iter().any(|r| r.contains("gate proof stale")) { "rerun gates (proof stale)".to_string() }
+            if reasons.iter().any(|r| r.contains("shared reconciliation pending")) { "merge verified shared result and validate consumer".to_string() }
+            else if reasons.iter().any(|r| r.contains("gate proof stale")) { "rerun gates (proof stale)".to_string() }
             else if reasons.iter().any(|r| r.contains("outside claim")) { "refresh claims or changeset".to_string() }
             else if reasons.iter().any(|r| r.contains("has not passed yet") || r.contains("have not run")) { "run gates".to_string() }
             else { "refresh claims or changeset".to_string() }
@@ -84,6 +85,9 @@ pub fn build_board(store: &Store, repo_id: i64, repo: &Path, cfg: &TowerConfig) 
         "lease": lease,
         "tasks": tasks, "assignments": assignments, "claims": claims, "changesets": changesets, "superseded_changesets": superseded_changesets,
         "worktrees": worktrees, "collisions": collisions, "integration_order": order,
+        "scheduler": crate::scheduler::status(store,repo_id,cfg)?,
+        "reconciliations": crate::reconcile::list(store,repo_id)?,
+        "resource_queue": crate::resources::list(store,Some(repo_id))?,
         "escalations": escalations, "decisions": decisions,
         "generated_at": crate::store::now_secs(),
     }))
@@ -96,6 +100,16 @@ pub fn render_text(b: &serde_json::Value) -> String {
     if let Some(h) = b["lease"].get("holder").and_then(|v| v.as_str()) { s.push_str(&format!("Orchestrator lease: {h}\n")); } else { s.push_str("Orchestrator lease: (none)\n"); }
     s.push_str("\nTASKS\n");
     for t in b["tasks"].as_array().cloned().unwrap_or_default() { s.push_str(&format!("  {} [{}] {}\n", t["id"].as_str().unwrap_or(""), t["state"].as_str().unwrap_or(""), t["title"].as_str().unwrap_or(""))); }
+    s.push_str("\nCOORDINATION\n");
+    for r in b["scheduler"]["runs"].as_array().cloned().unwrap_or_default() {
+        s.push_str(&format!("  run {} {} [{}] {}\n",r["id"],r["task_id"].as_str().unwrap_or(""),r["state"].as_str().unwrap_or(""),r["detail"].as_str().unwrap_or("")));
+    }
+    for r in b["reconciliations"].as_array().cloned().unwrap_or_default() {
+        s.push_str(&format!("  reconciliation {} [{}] (inspect: tower reconcile show)\n",r["id"].as_str().unwrap_or(""),r["state"].as_str().unwrap_or("")));
+    }
+    for q in b["resource_queue"].as_array().cloned().unwrap_or_default().into_iter().filter(|q|matches!(q["state"].as_str(),Some("queued"|"running"))) {
+        s.push_str(&format!("  resource job {} [{}] {}\n",q["id"],q["state"].as_str().unwrap_or(""),q["request_key"].as_str().unwrap_or("")));
+    }
     s.push_str("\nWORKTREES\n");
     for w in b["worktrees"].as_array().cloned().unwrap_or_default() {
         s.push_str(&format!("  [{}] {} ({}) branch={} files={} items={}\n", w["status"].as_str().unwrap_or("").to_uppercase(), w["label"].as_str().unwrap_or(""), w["path"].as_str().unwrap_or(""), w["branch"].as_str().unwrap_or("(detached)"), w["files"].as_array().map(|a| a.len()).unwrap_or(0), w["changed_items"].as_array().map(|a| a.len()).unwrap_or(0)));

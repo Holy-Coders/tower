@@ -58,6 +58,24 @@ pub fn dispatch(store: &Store, name: &str, args: &serde_json::Value) -> Result<s
 
 fn dispatch_inner(store: &Store, name: &str, args: &serde_json::Value) -> Result<serde_json::Value> {
     match name {
+        "schedule" | "reconcile" | "resources" => {
+            let (rid,root,cfg)=resolve(store,&s(args,"repo")?)?;
+            let action=s(args,"action")?;
+            let input=args.get("input").cloned().unwrap_or(serde_json::json!({}));
+            match name {
+                "schedule"=>crate::scheduler::dispatch(store,rid,&root,&cfg,&action,&input),
+                "reconcile"=>crate::reconcile::dispatch(store,rid,&root,&cfg,&action,&input),
+                _=>match action.as_str() {
+                    "list"=>Ok(serde_json::to_value(crate::resources::list(store,Some(rid))?)?),
+                    "cancel"|"recover"=>{
+                        let id=input["id"].as_i64().context("missing resource job id")?;
+                        if action=="cancel" {Ok(serde_json::to_value(crate::resources::cancel(store,rid,id)?)?)}
+                        else {Ok(serde_json::to_value(crate::resources::recover(store,rid,id,input["confirmed_stopped"].as_bool().unwrap_or(false))?)?)}
+                    }
+                    _=>bail!("unknown resources action {action}"),
+                }
+            }
+        }
         "board_get" => { let (rid, root, cfg) = resolve(store, &s(args, "repo")?)?; crate::feedback::flush_best_effort(store, rid, &cfg); board::build_board(store, rid, &root, &cfg) }
         "worktree_list" => {
             let (_, root, cfg) = resolve(store, &s(args, "repo")?)?;
@@ -152,6 +170,9 @@ pub fn tool_defs() -> serde_json::Value {
     let p = |pairs: &[(&str, serde_json::Value)]| pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect::<serde_json::Map<String, serde_json::Value>>();
     let st = serde_json::json!({"type": "string"});
     serde_json::json!([
+        t("schedule", "Opt-in agent scheduling: configure (task_id,spec), ready, status, tick (holder), cancel (task_id). Agents are configured executables; no automatic landing.", p(&[("action",serde_json::json!({"type":"string","enum":["configure","ready","status","tick","cancel"]})),("input",serde_json::json!({"type":"object","description":"Action-specific input. configure: task_id and spec {depends_on:[T-id],nodes:[{file,item}],max_attempts:1..5,agent?:{program,args,timeout_secs}}; tick: holder; cancel: task_id"}))]), &["action"]),
+        t("reconcile", "Cooperative semantic overlap handoff. discover/list/show/request/pause/contract/stub-ack/publish/resume/cancel; authored intent and contract required, no automatic rewriting of worker drafts. See RECONCILIATION.md.", p(&[("action",st.clone()),("input",serde_json::json!({"type":"object","description":format!("Exact action input examples: {}",crate::reconcile::action_help())}))]), &["action"]),
+        t("resources", "Inspect exclusive FIFO gate queue or cancel/recover a job. recover requires id and confirmed_stopped=true after checking orphan work stopped.", p(&[("action",serde_json::json!({"type":"string","enum":["list","cancel","recover"]})),("input",serde_json::json!({"type":"object","properties":{"id":{"type":"integer"},"confirmed_stopped":{"type":"boolean"}}}))]), &["action"]),
         t("board_get", "Full board state", p(&[]), &[]),
         t("task_create", "Create task -> T-ID", p(&[("title", st.clone()), ("brief", st.clone())]), &["title"]),
         t("task_plan_save", "Store plan decomposition", p(&[("task_id", st.clone()), ("plan", st.clone())]), &["task_id", "plan"]),

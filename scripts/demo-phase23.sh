@@ -10,7 +10,7 @@
 #       still exits 0;
 #   (d) a later `report flush` — and the opportunistic flush at the
 #       start of `board` — files queued reports;
-#   plus MCP (20 tools, report_create files), a slow operation drafted
+#   plus MCP (23 tools, report_create files), a slow operation drafted
 #   automatically, enabled=false recording locally only, and the
 #   5-per-day filing cap.
 #
@@ -19,6 +19,7 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$ROOT/scripts/demo-common.sh"
 BIN="${TOWER_BIN:-$ROOT/target/release/tower}"
 if [ ! -x "$BIN" ]; then
   echo "building release binary..."
@@ -117,7 +118,7 @@ sys.exit(0 if len(v["reports"]) == 1 and v["reports"][0]["occurrence_count"] == 
 PY
 if [ $? -eq 0 ]; then pass "report list shows one coalesced report with count 2"; else fail "report list shows one coalesced report with count 2"; fi
 
-echo "== step 4: MCP advertises 20 tools and report_create files =="
+echo "== step 4: MCP advertises 23 tools and report_create files =="
 cat > "$OUT/mcp1.jsonl" <<EOF
 {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"report_create","arguments":{"repo":"$REPO","kind":"inefficiency","title":"CLI and MCP disagree on board","body":"MCP board_get differed from CLI board","command":"tower board --password hunter2demo"}}}
@@ -125,7 +126,7 @@ EOF
 "$BIN" --repo "$REPO" serve-mcp < "$OUT/mcp1.jsonl" > "$OUT/mcp1-out.jsonl" 2>&1
 TOOLS_LINE="$(grep '"id":1' "$OUT/mcp1-out.jsonl" | head -1)"
 N_TOOLS="$(printf '%s' "$TOOLS_LINE" | grep -o '"name":' | wc -l | tr -d ' ')"
-eq "MCP tools/list advertises 20 tools" "$N_TOOLS" "20"
+eq "MCP tools/list advertises 23 tools" "$N_TOOLS" "23"
 grepq "MCP advertises report_create" "$OUT/mcp1-out.jsonl" 'report_create'
 grepq "report_create description fences off orchestrated code" "$OUT/mcp1-out.jsonl" 'Do NOT report bugs in the code you are orchestrating'
 grepq "MCP report_create result is filed" "$OUT/mcp1-out.jsonl" '"state":"filed"'
@@ -179,7 +180,7 @@ if [ $? -eq 0 ]; then pass "automatic slow report has kind inefficiency"; else f
 
 echo "== step 7: enabled=false records locally; daily cap holds at 5 =="
 BEFORE="$(creates)"
-sed -i 's/enabled = true/enabled = false/' "$REPO/tower.toml"
+edit_fixture_file "$REPO/tower.toml" 'enabled = true' 'enabled = false' || exit 1
 for w in red blue green black white pink; do
   TW report --kind bug --title "cap probe $w failure" --body "queued only while disabled" > "$OUT/cap-$w.json" 2>&1
 done
@@ -188,7 +189,7 @@ grepq "disabled flush is a no-op" "$OUT/flush-disabled.json" '"filed": 0'
 eq "nothing filed while feedback disabled" "$(creates)" "$BEFORE"
 TW report list > "$OUT/list5.json" 2>&1
 grepq "disabled reports still recorded locally as queued" "$OUT/list5.json" 'cap probe red failure'
-sed -i 's/enabled = false/enabled = true/' "$REPO/tower.toml"
+edit_fixture_file "$REPO/tower.toml" 'enabled = false' 'enabled = true' || exit 1
 TW report flush > "$OUT/flush-cap.json" 2>&1
 TW report list > "$OUT/list6.json" 2>&1
 python3 - "$OUT/list6.json" <<'PY'

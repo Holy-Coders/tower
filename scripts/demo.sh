@@ -16,6 +16,7 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$ROOT/scripts/demo-common.sh"
 BIN="${TOWER_BIN:-$ROOT/target/release/tower}"
 if [ ! -x "$BIN" ]; then
   echo "building release binary..."
@@ -105,9 +106,9 @@ grepq "static HTML board generated" "$OUT/board.html" "Tower Board"
 
 echo "== step 3: three worktrees, two conflicting on add(), one unrelated =="
 for w in w1 w2 w3; do git -C "$REPO" worktree add -q -b "$w" "$SCRATCH/$w" main; gitc "$SCRATCH/$w"; done
-sed -i 's/return a + b;/return a + b + 0;/' "$SCRATCH/w1/src/math.ts"
-sed -i 's/return a + b;/const s = a + b;\n  return s;/' "$SCRATCH/w2/src/math.ts"
-sed -i 's/return 1;/return 2;/' "$SCRATCH/w3/src/other.ts"
+edit_fixture_file "$SCRATCH/w1/src/math.ts" 'return a + b;' 'return a + b + 0;' || exit 1
+edit_fixture_file "$SCRATCH/w2/src/math.ts" 'return a + b;' 'const s = a + b;\n  return s;' || exit 1
+edit_fixture_file "$SCRATCH/w3/src/other.ts" 'return 1;' 'return 2;' || exit 1
 for w in w1 w2 w3; do git -C "$SCRATCH/$w" add -A; git -C "$SCRATCH/$w" commit -qm "$w work"; done
 check "three worktrees created" test -d "$SCRATCH/w3/src"
 
@@ -169,7 +170,7 @@ TOOLS_LINE="$(grep '"id":2' "$OUT/mcp1-out.jsonl" | head -1)"
 N_TOOLS="$(printf '%s' "$TOOLS_LINE" | grep -o '"name":' | wc -l | tr -d ' ')"
 # Phase 2.1 intentional change: 16 spec tools + changeset_refresh/supersede;
 # Phase 2.2 adds changeset_conflicts (19 total).
-if [ "$N_TOOLS" = "20" ]; then pass "MCP tools/list advertises 20 tools (16 + refresh/supersede/conflicts/report)"; else fail "MCP tools/list advertises 20 tools (got $N_TOOLS)"; fi
+if [ "$N_TOOLS" = "23" ]; then pass "MCP tools/list advertises 23 tools (16 + refresh/supersede/conflicts/report)"; else fail "MCP tools/list advertises 23 tools (got $N_TOOLS)"; fi
 grepq "MCP task_create -> T-4" "$OUT/mcp1-out.jsonl" '"task_id":"T-4"'
 grepq "MCP worktree_create -> A-4" "$OUT/mcp1-out.jsonl" '"assignment_id":"A-4"'
 grepq "MCP claim granted" "$OUT/mcp1-out.jsonl" '"granted":true'
@@ -180,7 +181,7 @@ WT="$(find "$TOWER_HOME/worktrees" -maxdepth 2 -name A-4 -type d | head -1)"
 case "$WT" in "$TOWER_HOME"*) pass "managed worktree lives under ~/.tower/worktrees";; *) fail "managed worktree lives under ~/.tower/worktrees (got $WT)";; esac
 # The worker does its job inside its claim.
 gitc "$WT"
-sed -i 's/hello ${name}/hello ${name.trim()}/' "$WT/src/greet.ts"
+edit_fixture_file "$WT/src/greet.ts" 'hello ${name}' 'hello ${name.trim()}' || exit 1
 git -C "$WT" add -A; git -C "$WT" commit -qm "trim greet name"
 
 # Rehearsal across all open changesets on the scratch integration tree.
